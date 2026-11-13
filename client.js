@@ -645,6 +645,16 @@ window.__ModuleLoader__.load({
         if (card.contains(event.target)) return
         close()
       })
+      /* Keep wheel/trackpad scrolling inside the dialog: the chat transcript
+         behind the mask must not move while a dialog is open. */
+      backdrop.addEventListener(
+        'wheel',
+        function (event) {
+          if (card.contains(event.target)) return
+          event.preventDefault()
+        },
+        { passive: false },
+      )
       document.body.appendChild(backdrop)
       openDialogs.push(handle)
       return handle

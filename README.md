@@ -65,6 +65,28 @@ ln -sfn /Users/youngwu/Documents/code/dsh-rewind node_modules/dsh-rewind
 - 撤回 / 编辑之后，界面上会留下一行折叠提示，点「放回输入框」就能把文字和附件拿回来。
 - 失败都会以 toast 说明原因（例如「该会话尚未加载，请先在 DSH 里打开它」）。
 
+## 和 dsh-claude-style 的关系
+
+DSH 里如果同时装了 `dsh-claude-style`，用户消息下方会看到**两套**编辑/撤回按钮，语义不一样：
+
+| | dsh-claude-style | dsh-rewind |
+| --- | --- | --- |
+| 编辑 | 从这条消息**分岔出一个新会话**，把改过的文字发过去 | **原地改写当前会话**，旧的后续内容从模型上下文移除 |
+| 撤回 | 分岔新会话，把原文放回新会话的输入框 | 原地把这段从模型上下文移除，界面折叠成提示行 |
+
+两条路都成立，但混在一起会让人不知道点哪个。建议只留一套：
+DSH 设置 → 会话 → 关掉 claude-style 的「消息操作」；或者在插件市场停用其中一个。
+
+## 主题与皮肤
+
+- 所有颜色都走 `--dsw-alias-*` 设计令牌（label-primary / label-secondary / label-tertiary、border-l2、
+  bg-layer-2 / bg-layer-3、interactive-bg-hover、brand-primary、state-error-primary 等），
+  浅色、深色、原生皮肤都自动跟随，不需要额外适配。
+- 弹窗是命令式 DOM，直接挂到 `document.body`，不挂在消息行里。
+  原因是官方聊天滚动容器带 `container-type: inline-size`（layout containment），
+  会成为 `position: fixed` 后代的包含块，弹窗会被裁在滚动区里、跟着内容滚走——
+  早期版本「点编辑之后什么都看不见」就是这个问题。
+
 ## 测试
 
 ```bash
