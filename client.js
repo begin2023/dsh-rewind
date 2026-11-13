@@ -541,176 +541,342 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------ */
-    /* shared dialog shell                                                 */
+    /* dialogs                                                             */
+    /*                                                                     */
+    /* Plain DOM appended straight to document.body — deliberately not      */
+    /* React children of the message row. The transcript lives inside a     */
+    /* scroll container that declares container-type: inline-size, and      */
+    /* layout containment makes that element the containing block for every */
+    /* position: fixed descendant. An overlay rendered inside a message row */
+    /* therefore scrolls away with the transcript and is clipped by the     */
+    /* scroller, which is exactly why the editor used to open nowhere       */
+    /* visible. Owning the DOM keeps the dialog centred on the viewport     */
+    /* wherever the row happens to be.                                      */
     /* ------------------------------------------------------------------ */
 
-    function Overlay(props) {
-      const cardRef = useRef(null)
-      useEffect(() => {
-        const onKey = (event) => {
-          if (event.key === 'Escape') {
-            event.stopPropagation()
-            props.onClose()
-          }
+    const openDialogs = []
+
+    function dom(tag, props, children) {
+      const node = document.createElement(tag)
+      if (props) {
+        for (const key of Object.keys(props)) {
+          const value = props[key]
+          if (value === null || value === undefined || value === false) continue
+          if (key === 'class') node.className = String(value)
+          else if (key === 'text') node.textContent = String(value)
+          else if (key === 'style') node.style.cssText = String(value)
+          else node.setAttribute(key, value === true ? '' : String(value))
         }
-        document.addEventListener('keydown', onKey, true)
-        return () => document.removeEventListener('keydown', onKey, true)
-      }, [props.onClose])
-      const onMouseDown = (event) => {
-        if (cardRef.current !== null && cardRef.current.contains(event.target)) return
-        props.onClose()
       }
-      return h(
-        'div',
-        { className: 'dsh-rw-backdrop', onMouseDown: onMouseDown },
-        h(
-          'div',
-          { className: 'dsh-rw-dialog', ref: cardRef, role: 'dialog', 'aria-modal': 'true' },
-          props.children,
-        ),
-      )
+      if (Array.isArray(children)) {
+        for (const child of children) if (child) node.appendChild(child)
+      }
+      return node
     }
 
-    function ConfirmRecall(props) {
-      const [busy, setBusy] = useState(false)
-      const [error, setError] = useState('')
-      const confirm = async () => {
-        if (busy) return
-        setBusy(true)
-        setError('')
+    function focusableIn(card) {
+      const all = Array.prototype.slice.call(card.querySelectorAll('button, textarea, input, [tabindex]'))
+      const out = []
+      for (const node of all) {
+        if (node.disabled) continue
+        if (node.getAttribute('tabindex') === '-1') continue
+        out.push(node)
+      }
+      return out
+    }
+
+    function mountDialog(options) {
+      const backdrop = dom('div', { class: 'dsh-rw-backdrop' })
+      const card = dom('div', { class: 'dsh-rw-dialog', role: 'dialog', 'aria-modal': 'true' })
+      card.appendChild(
+        dom('div', { class: 'dsh-rw-dialog-head' }, [
+          dom('div', { class: 'dsh-rw-dialog-title', text: options.title }),
+          options.sub ? dom('div', { class: 'dsh-rw-dialog-sub', text: options.sub }) : null,
+        ]),
+      )
+      card.appendChild(dom('div', { class: 'dsh-rw-dialog-body' }, options.body))
+      card.appendChild(dom('div', { class: 'dsh-rw-dialog-foot' }, options.footer))
+      backdrop.appendChild(card)
+      const previous = document.activeElement
+      let closed = false
+      const handle = { card: card, close: null, isClosed: function () { return closed } }
+
+      function onKeyDown(event) {
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          event.stopPropagation()
+          close()
+          return
+        }
+        if (event.key !== 'Tab') return
+        const focusable = focusableIn(card)
+        if (focusable.length === 0) return
+        const first = focusable[0]
+        const last = focusable[focusable.length - 1]
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault()
+          last.focus()
+          return
+        }
+        if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault()
+          first.focus()
+        }
+      }
+
+      function close() {
+        if (closed) return
+        closed = true
+        document.removeEventListener('keydown', onKeyDown, true)
+        if (backdrop.parentNode !== null) backdrop.parentNode.removeChild(backdrop)
+        const at = openDialogs.indexOf(handle)
+        if (at >= 0) openDialogs.splice(at, 1)
         try {
-          const value = await callHost('recall', { sessionId: props.sessionId, seq: props.seq })
-          props.onClose()
-          const count = value && typeof value.shadowed === 'number' ? value.shadowed : 0
-          showToast(count > 0 ? '已撤回，模型上下文里移除了 ' + count + ' 条内容' : '已撤回')
+          if (previous && previous.isConnected && typeof previous.focus === 'function') previous.focus()
         } catch (problem) {
-          setError(problem && problem.message ? problem.message : '撤回失败')
-        } finally {
-          setBusy(false)
+          /* the row may already be gone */
         }
+        if (typeof options.onClose === 'function') options.onClose()
       }
-      return h(
-        Overlay,
-        { onClose: props.onClose },
-        h(
-          'div',
-          { className: 'dsh-rw-dialog-head' },
-          h('div', { className: 'dsh-rw-dialog-title' }, props.role === 'assistant' ? '撤回这条回复' : '撤回这条消息'),
-          h('div', { className: 'dsh-rw-dialog-sub' }, '从模型上下文中移除'),
-        ),
-        h(
-          'div',
-          { className: 'dsh-rw-dialog-body' },
-          h(
-            'div',
-            { className: 'dsh-rw-hint' },
-            props.role === 'assistant'
-              ? '撤回后，这条回复以及它之后的内容会从模型上下文中移除。界面上它们会折叠成一行提示，之后继续对话时模型不会记得它们。'
-              : '撤回后，这条消息以及它之后的所有内容会从模型上下文中移除。界面上它们会折叠成一行提示，之后继续对话时模型不会记得它们。想重新发送，可以从那行提示里把文字和附件放回输入框。',
-          ),
-          error !== '' ? h('div', { className: 'dsh-rw-error' }, error) : null,
-        ),
-        h(
-          'div',
-          { className: 'dsh-rw-dialog-foot' },
-          h('div', { className: 'dsh-rw-foot-spacer' }),
-          h('button', { type: 'button', className: 'dsh-rw-ghost', onClick: props.onClose, disabled: busy }, '取消'),
-          h(
-            'button',
-            { type: 'button', className: 'dsh-rw-danger', onClick: confirm, disabled: busy },
-            busy ? '撤回中…' : '撤回',
-          ),
-        ),
-      )
+
+      handle.close = close
+      document.addEventListener('keydown', onKeyDown, true)
+      backdrop.addEventListener('mousedown', function (event) {
+        if (card.contains(event.target)) return
+        close()
+      })
+      document.body.appendChild(backdrop)
+      openDialogs.push(handle)
+      return handle
     }
 
-    function EditDialog(props) {
-      const [text, setText] = useState(props.initialText)
-      const [items, setItems] = useState(props.initialItems)
-      const [busy, setBusy] = useState(false)
-      const [error, setError] = useState('')
-      const [previews, setPreviews] = useState({})
-      const textRef = useRef(null)
-      const fileRef = useRef(null)
-
-      useEffect(() => {
-        const element = textRef.current
-        if (element !== null && typeof element.focus === 'function') {
-          element.focus()
-          const end = element.value.length
-          if (typeof element.setSelectionRange === 'function') element.setSelectionRange(end, end)
+    function closeAllDialogs() {
+      const all = openDialogs.slice()
+      for (const handle of all) {
+        try {
+          handle.close()
+        } catch (problem) {
+          /* ignore */
         }
-      }, [])
+      }
+    }
 
-      useEffect(() => {
-        let cancelled = false
-        const missing = items.filter(
-          (item) => item.block && item.block.type === 'image' && previews[item.key] === undefined,
-        )
-        if (missing.length === 0) return undefined
-        void (async () => {
-          for (const item of missing) {
+    function openRecallDialog(options) {
+      const assistant = options.role === 'assistant'
+      const errorLine = dom('div', { class: 'dsh-rw-error' })
+      errorLine.style.display = 'none'
+      const hint = dom('div', {
+        class: 'dsh-rw-hint',
+        text: assistant
+          ? '撤回后，这条回复以及它之后的内容会从模型上下文中移除。界面上它们会折叠成一行提示，之后继续对话时模型不会记得它们。'
+          : '撤回后，这条消息以及它之后的所有内容会从模型上下文中移除。界面上它们会折叠成一行提示，之后继续对话时模型不会记得它们。想重新发送，可以从那行提示里把文字和附件放回输入框。',
+      })
+      const cancelButton = dom('button', { type: 'button', class: 'dsh-rw-ghost', text: '取消' })
+      const confirmButton = dom('button', { type: 'button', class: 'dsh-rw-danger', text: '撤回' })
+      let busy = false
+      const handle = mountDialog({
+        title: assistant ? '撤回这条回复' : '撤回这条消息',
+        sub: '从模型上下文中移除',
+        body: [hint, errorLine],
+        footer: [dom('div', { class: 'dsh-rw-foot-spacer' }), cancelButton, confirmButton],
+        onClose: options.onClose,
+      })
+      cancelButton.addEventListener('click', function () {
+        handle.close()
+      })
+      confirmButton.addEventListener('click', function () {
+        if (busy) return
+        busy = true
+        confirmButton.disabled = true
+        cancelButton.disabled = true
+        confirmButton.textContent = '撤回中…'
+        errorLine.style.display = 'none'
+        void (async function () {
+          try {
+            const value = await callHost('recall', { sessionId: options.sessionId, seq: options.seq })
+            handle.close()
+            const count = value && typeof value.shadowed === 'number' ? value.shadowed : 0
+            showToast(count > 0 ? '已撤回，模型上下文里移除了 ' + count + ' 条内容' : '已撤回')
+          } catch (problem) {
+            errorLine.textContent = problem && problem.message ? problem.message : '撤回失败'
+            errorLine.style.display = ''
+            confirmButton.disabled = false
+            cancelButton.disabled = false
+            confirmButton.textContent = '撤回'
+          } finally {
+            busy = false
+          }
+        })()
+      })
+      confirmButton.focus()
+      return handle
+    }
+
+    function openEditDialog(options) {
+      const sessionId = options.sessionId
+      const seq = options.seq
+      const source = Array.isArray(options.blocks) ? options.blocks : []
+      const items = source.filter(isAttachmentBlock).map(function (block, position) {
+        const attachment = block.attachment || {}
+        return {
+          key: 'existing-' + position + '-' + String(attachment.attachmentId || position),
+          block: block,
+          name: attachmentLabel(block),
+          mediaType: attachment.mediaType || '',
+          isImage: block.type === 'image',
+          preview: '',
+        }
+      })
+      const objectUrls = []
+      let busy = false
+
+      const textarea = dom('textarea', {
+        class: 'dsh-rw-textarea',
+        placeholder: '输入新的内容…',
+        spellcheck: 'false',
+      })
+      textarea.value = textOfBlocks(source)
+      const chips = dom('div', { class: 'dsh-rw-files' })
+      const errorLine = dom('div', { class: 'dsh-rw-error' })
+      errorLine.style.display = 'none'
+      const hint = dom('div', {
+        class: 'dsh-rw-hint',
+        text: '保存后，这条消息以及它之后的内容会从模型上下文中移除，然后按新内容重新提问。原有附件会一起带上，除非你在这里移除它。',
+      })
+      const filePicker = dom('input', { type: 'file', multiple: 'multiple' })
+      filePicker.style.display = 'none'
+      const addButton = dom('button', { type: 'button', class: 'dsh-rw-ghost', text: '添加图片或文件' })
+      const cancelButton = dom('button', { type: 'button', class: 'dsh-rw-ghost', text: '取消' })
+      const saveButton = dom('button', { type: 'button', class: 'dsh-rw-primary', text: '保存并重新发送' })
+
+      const handle = mountDialog({
+        title: '编辑消息',
+        sub: '保存后重新发送',
+        body: [textarea, chips, hint, errorLine],
+        footer: [
+          filePicker,
+          addButton,
+          dom('div', { class: 'dsh-rw-foot-spacer' }),
+          cancelButton,
+          saveButton,
+        ],
+        onClose: function () {
+          for (const url of objectUrls) {
+            try {
+              URL.revokeObjectURL(url)
+            } catch (problem) {
+              /* ignore */
+            }
+          }
+          if (typeof options.onClose === 'function') options.onClose()
+        },
+      })
+
+      function setBusy(next) {
+        busy = next
+        saveButton.disabled = next
+        cancelButton.disabled = next
+        addButton.disabled = next
+        saveButton.textContent = next ? '保存中…' : '保存并重新发送'
+      }
+
+      function setError(message) {
+        errorLine.textContent = message || ''
+        errorLine.style.display = message ? '' : 'none'
+      }
+
+      function removeItem(key) {
+        for (let index = items.length - 1; index >= 0; index -= 1) {
+          if (items[index].key === key) items.splice(index, 1)
+        }
+        renderChips()
+      }
+
+      function renderChips() {
+        chips.textContent = ''
+        chips.style.display = items.length === 0 ? 'none' : ''
+        for (const item of items) {
+          const chip = dom('div', { class: 'dsh-rw-file' })
+          if (item.isImage && item.preview) {
+            const image = dom('img', { class: 'dsh-rw-file-thumb', alt: '' })
+            image.src = item.preview
+            chip.appendChild(image)
+          } else {
+            chip.appendChild(dom('div', { class: 'dsh-rw-file-icon', text: item.isImage ? '图片' : '文件' }))
+          }
+          chip.appendChild(dom('div', { class: 'dsh-rw-file-name', title: item.name, text: item.name }))
+          const remove = dom('button', {
+            type: 'button',
+            class: 'dsh-rw-file-remove',
+            title: '移除这个附件',
+            text: '×',
+          })
+          remove.addEventListener('click', function () {
+            removeItem(item.key)
+          })
+          chip.appendChild(remove)
+          chips.appendChild(chip)
+        }
+      }
+
+      function addFiles(fileList) {
+        const stamp = Date.now()
+        let position = 0
+        for (const file of fileList) {
+          const item = {
+            key: 'new-' + stamp + '-' + position + '-' + file.name,
+            block: null,
+            file: file,
+            name: file.name,
+            mediaType: file.type || '',
+            isImage: IMAGE_TYPES.indexOf(file.type) >= 0,
+            preview: '',
+          }
+          if (item.isImage && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+            try {
+              item.preview = URL.createObjectURL(file)
+              objectUrls.push(item.preview)
+            } catch (problem) {
+              item.preview = ''
+            }
+          }
+          items.push(item)
+          position += 1
+        }
+        renderChips()
+      }
+
+      function loadPreviews() {
+        for (const item of items) {
+          if (!item.isImage || !item.block || item.preview || item.loading) continue
+          item.loading = true
+          void (async function () {
             try {
               const payload = await callHost('attachment', {
-                sessionId: props.sessionId,
+                sessionId: sessionId,
                 kind: 'image',
                 attachment: item.block.attachment,
               })
-              if (cancelled) return
-              setPreviews((previous) => {
-                const next = Object.assign({}, previous)
-                next[item.key] = 'data:' + (payload.mediaType || 'image/png') + ';base64,' + payload.data
-                return next
-              })
-            } catch {
-              if (cancelled) return
-              setPreviews((previous) => {
-                const next = Object.assign({}, previous)
-                next[item.key] = ''
-                return next
-              })
+              item.preview = 'data:' + (payload.mediaType || 'image/png') + ';base64,' + payload.data
+            } catch (problem) {
+              item.preview = ''
             }
-          }
-        })()
-        return () => {
-          cancelled = true
+            renderChips()
+          })()
         }
-      }, [items, previews, props.sessionId])
-
-      const addFiles = (fileList) => {
-        const incoming = []
-        for (const file of fileList) incoming.push(file)
-        if (incoming.length === 0) return
-        const stamp = Date.now()
-        setItems((previous) =>
-          previous.concat(
-            incoming.map((file, position) => ({
-              key: 'new-' + stamp + '-' + position + '-' + file.name,
-              block: null,
-              file: file,
-              name: file.name,
-              mediaType: file.type,
-              isImage: IMAGE_TYPES.indexOf(file.type) >= 0,
-            })),
-          ),
-        )
       }
 
-      const remove = (key) => {
-        setItems((previous) => previous.filter((item) => item.key !== key))
-      }
-
-      const save = async () => {
+      async function save() {
         if (busy) return
         setBusy(true)
-        setError('')
+        setError('');
         try {
           const add = []
           for (const item of items) {
             if (!item.file) continue
             const buffer = await item.file.arrayBuffer()
             const payload = await callHost('upload', {
-              sessionId: props.sessionId,
+              sessionId: sessionId,
               kind: item.isImage ? 'image' : 'file',
               name: item.file.name,
               mediaType: item.file.type || 'application/octet-stream',
@@ -726,13 +892,13 @@ window.__ModuleLoader__.load({
             if (typeof id === 'string') keep.push(id)
           }
           await callHost('edit', {
-            sessionId: props.sessionId,
-            seq: props.seq,
-            text: text,
+            sessionId: sessionId,
+            seq: seq,
+            text: textarea.value,
             keep: keep,
             add: add,
           })
-          props.onClose()
+          handle.close()
           showToast('已保存并重新发送')
         } catch (problem) {
           setError(problem && problem.message ? problem.message : '保存失败')
@@ -741,99 +907,57 @@ window.__ModuleLoader__.load({
         }
       }
 
-      return h(
-        Overlay,
-        { onClose: props.onClose },
-        h(
-          'div',
-          { className: 'dsh-rw-dialog-head' },
-          h('div', { className: 'dsh-rw-dialog-title' }, '编辑消息'),
-          h('div', { className: 'dsh-rw-dialog-sub' }, '保存后重新发送'),
-        ),
-        h(
-          'div',
-          { className: 'dsh-rw-dialog-body' },
-          h('textarea', {
-            className: 'dsh-rw-textarea',
-            ref: textRef,
-            value: text,
-            spellCheck: false,
-            placeholder: '输入新的内容…',
-            onChange: (event) => setText(event.target.value),
-            onKeyDown: (event) => {
-              if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-                event.preventDefault()
-                void save()
-              }
-            },
-          }),
-          items.length > 0
-            ? h(
-                'div',
-                { className: 'dsh-rw-files' },
-                items.map((item) =>
-                  h(
-                    'div',
-                    { className: 'dsh-rw-file', key: item.key },
-                    item.isImage && previews[item.key]
-                      ? h('img', { className: 'dsh-rw-file-thumb', src: previews[item.key], alt: '' })
-                      : h('div', { className: 'dsh-rw-file-icon' }, item.isImage ? '图片' : '文件'),
-                    h('div', { className: 'dsh-rw-file-name', title: item.name }, item.name),
-                    h(
-                      'button',
-                      {
-                        type: 'button',
-                        className: 'dsh-rw-file-remove',
-                        title: '移除这个附件',
-                        onClick: () => remove(item.key),
-                      },
-                      '×',
-                    ),
-                  ),
-                ),
-              )
-            : null,
-          h(
-            'div',
-            { className: 'dsh-rw-hint' },
-            '保存后，这条消息以及它之后的内容会从模型上下文中移除，然后按新内容重新提问。原有附件会一起带上，除非你在这里移除它。',
-          ),
-          error !== '' ? h('div', { className: 'dsh-rw-error' }, error) : null,
-        ),
-        h(
-          'div',
-          { className: 'dsh-rw-dialog-foot' },
-          h('input', {
-            ref: fileRef,
-            type: 'file',
-            multiple: true,
-            style: { display: 'none' },
-            onChange: (event) => {
-              addFiles(event.target.files || [])
-              event.target.value = ''
-            },
-          }),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dsh-rw-ghost',
-              disabled: busy,
-              onClick: () => {
-                if (fileRef.current !== null) fileRef.current.click()
-              },
-            },
-            '添加图片或文件',
-          ),
-          h('div', { className: 'dsh-rw-foot-spacer' }),
-          h('button', { type: 'button', className: 'dsh-rw-ghost', onClick: props.onClose, disabled: busy }, '取消'),
-          h(
-            'button',
-            { type: 'button', className: 'dsh-rw-primary', onClick: save, disabled: busy },
-            busy ? '保存中…' : '保存并重新发送',
-          ),
-        ),
-      )
+      textarea.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+          event.preventDefault()
+          void save()
+        }
+      })
+      textarea.addEventListener('paste', function (event) {
+        const clipboard = event.clipboardData
+        const files = clipboard && clipboard.files ? Array.prototype.slice.call(clipboard.files) : []
+        if (files.length === 0) return
+        event.preventDefault()
+        addFiles(files)
+      })
+      filePicker.addEventListener('change', function () {
+        addFiles(Array.prototype.slice.call(filePicker.files || []))
+        filePicker.value = ''
+      })
+      addButton.addEventListener('click', function () {
+        filePicker.click()
+      })
+      cancelButton.addEventListener('click', function () {
+        handle.close()
+      })
+      saveButton.addEventListener('click', function () {
+        void save()
+      })
+      handle.card.addEventListener('dragover', function (event) {
+        event.preventDefault()
+        handle.card.setAttribute('data-drop', 'true')
+      })
+      handle.card.addEventListener('dragleave', function () {
+        handle.card.removeAttribute('data-drop')
+      })
+      handle.card.addEventListener('drop', function (event) {
+        event.preventDefault()
+        handle.card.removeAttribute('data-drop')
+        const transfer = event.dataTransfer
+        const files = transfer && transfer.files ? Array.prototype.slice.call(transfer.files) : []
+        if (files.length > 0) addFiles(files)
+      })
+
+      renderChips()
+      loadPreviews()
+      try {
+        textarea.focus()
+        const end = textarea.value.length
+        if (typeof textarea.setSelectionRange === 'function') textarea.setSelectionRange(end, end)
+      } catch (problem) {
+        /* ignore */
+      }
+      return handle
     }
 
     /* ------------------------------------------------------------------ */
@@ -848,7 +972,6 @@ window.__ModuleLoader__.load({
       const seq = data.seq
       const blocks = Array.isArray(data.content) ? data.content : []
       const rowKey = node ? node.key : ''
-      const [dialog, setDialog] = useState('')
       const [busy, setBusy] = useState(false)
       const busyRef = useRef(false)
 
@@ -881,17 +1004,6 @@ window.__ModuleLoader__.load({
       const resend = () =>
         guard(() => refillAndAnnounce({ sessionId: sessionId, inputActions: inputActions, blocks: blocks }))
 
-      const initialItems = blocks.filter(isAttachmentBlock).map((block, position) => {
-        const attachment = block.attachment || {}
-        return {
-          key: 'existing-' + position + '-' + String(attachment.attachmentId || position),
-          block: block,
-          name: attachmentLabel(block),
-          mediaType: attachment.mediaType || '',
-          isImage: block.type === 'image',
-        }
-      })
-
       return h(
         'div',
         { className: 'dsh-rw-actions', ref: attach },
@@ -902,7 +1014,7 @@ window.__ModuleLoader__.load({
             className: 'dsh-rw-btn',
             disabled: busy,
             title: '编辑这条消息',
-            onClick: () => setDialog('edit'),
+            onClick: () => openEditDialog({ sessionId: sessionId, seq: seq, blocks: blocks }),
           },
           '编辑',
         ),
@@ -925,27 +1037,10 @@ window.__ModuleLoader__.load({
             'data-danger': 'true',
             disabled: busy,
             title: '撤回这条消息以及它之后的内容',
-            onClick: () => setDialog('recall'),
+            onClick: () => openRecallDialog({ sessionId: sessionId, seq: seq, role: 'user' }),
           },
           '撤回',
         ),
-        dialog === 'edit'
-          ? h(EditDialog, {
-              sessionId: sessionId,
-              seq: seq,
-              initialText: textOfBlocks(blocks),
-              initialItems: initialItems,
-              onClose: () => setDialog(''),
-            })
-          : null,
-        dialog === 'recall'
-          ? h(ConfirmRecall, {
-              sessionId: sessionId,
-              seq: seq,
-              role: 'user',
-              onClose: () => setDialog(''),
-            })
-          : null,
       )
     }
 
@@ -990,7 +1085,6 @@ window.__ModuleLoader__.load({
       const messageId = props.messageId
       const useChat = typeof props.useChat === 'function' ? props.useChat : NO_STATE
       const seq = useChat((snapshot) => assistantSeqOf(snapshot, messageId))
-      const [dialog, setDialog] = useState('')
       const [busy, setBusy] = useState(false)
       const busyRef = useRef(false)
       const ready = typeof seq === 'number'
@@ -1032,18 +1126,10 @@ window.__ModuleLoader__.load({
             'data-danger': 'true',
             disabled: busy || !ready,
             title: '撤回这条回复以及它之后的内容',
-            onClick: () => setDialog('recall'),
+            onClick: () => openRecallDialog({ sessionId: sessionId, seq: seq, role: 'assistant' }),
           },
           iconUndo(),
         ),
-        dialog === 'recall' && ready
-          ? h(ConfirmRecall, {
-              sessionId: sessionId,
-              seq: seq,
-              role: 'assistant',
-              onClose: () => setDialog(''),
-            })
-          : null,
       )
     }
 
@@ -1323,8 +1409,10 @@ window.__ModuleLoader__.load({
       AssistantActions: AssistantActions,
       MarkerRow: MarkerRow,
       HideSync: HideSync,
-      EditDialog: EditDialog,
-      ConfirmRecall: ConfirmRecall,
+      mountDialog: mountDialog,
+      openEditDialog: openEditDialog,
+      openRecallDialog: openRecallDialog,
+      closeAllDialogs: closeAllDialogs,
       hiddenKeysFor: hiddenKeysFor,
       hideCss: hideCss,
       textOfBlocks: textOfBlocks,

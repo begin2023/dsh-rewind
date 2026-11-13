@@ -107,20 +107,10 @@ const markerHtml = render('MarkerRow', React.createElement(T.MarkerRow, {
 check('marker shows 已撤回', markerHtml.includes('已撤回'), markerHtml.slice(0, 120))
 check('marker offers 放回输入框', markerHtml.includes('放回输入框'), markerHtml.includes('放回输入框'))
 
-const editHtml = render('EditDialog', React.createElement(T.EditDialog, {
-  sessionId: 's1', seq: 2, initialText: '看看这张图和笔记',
-  initialItems: [
-    { key: 'existing-0-a1', block: userBlocks[1], name: 'map.png', mediaType: 'image/png', isImage: true },
-    { key: 'existing-1-a2', block: userBlocks[2], name: 'notes.md', mediaType: 'text/markdown', isImage: false },
-  ],
-  onClose: () => {},
-}))
-check('edit dialog keeps both attachments', editHtml.includes('map.png') && editHtml.includes('notes.md'), editHtml.includes('map.png') + '/' + editHtml.includes('notes.md'))
-check('edit dialog has save button', editHtml.includes('保存并重新发送'), editHtml.includes('保存并重新发送'))
-check('edit dialog has add button', editHtml.includes('添加图片或文件'), editHtml.includes('添加图片或文件'))
-
-const recallHtml = render('ConfirmRecall', React.createElement(T.ConfirmRecall, { sessionId: 's1', seq: 2, role: 'user', onClose: () => {} }))
-check('recall dialog explains context cut', recallHtml.includes('模型上下文中移除'), recallHtml.slice(0, 140))
+const dialogHelpers = ['mountDialog', 'openEditDialog', 'openRecallDialog', 'closeAllDialogs']
+const missingHelpers = dialogHelpers.filter((name) => typeof T[name] !== 'function')
+check('dialog helpers are exported for the DOM layer', missingHelpers.length === 0, missingHelpers.join(','))
+check('dialogs are no longer React components', T.EditDialog === undefined && T.ConfirmRecall === undefined, typeof T.EditDialog)
 
 const hideHtml = renderToStaticMarkup(React.createElement(T.HideSync, { useChat }))
 check('HideSync renders nothing', hideHtml === '', hideHtml)
