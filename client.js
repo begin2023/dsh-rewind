@@ -1,12 +1,12 @@
 /**
  * dsh-rewind - browser half.
  *
- * Adds message-level 编辑 / 撤回 / 重发 to a DSH conversation:
+ * Adds message-level 编辑 / 重新生成 to a DSH conversation:
  *
  *   - a hover-revealed action row directly under every user message, rendered as
  *     a plugin-owned chat node kind so the official row renderer is never
  *     displaced,
- *   - 重新生成 / 撤回 on the official assistant action row,
+ *   - 重新生成 on the official assistant action row,
  *   - a marker row wherever a range was folded away, which can put the original
  *     text AND every attachment back into the composer,
  *   - an editor that keeps the message's existing attachments and lets new ones
@@ -21,7 +21,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: 'dsh-rewind',
+  id: '@begin2023/dsh-rewind',
   factory(require) {
     'use strict'
 
@@ -44,6 +44,7 @@ window.__ModuleLoader__.load({
     const HIDE_STYLE_ID = 'dsh-rewind-hide'
     /** Media types the host stores and re-sends as images. */
     const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+    const MAX_UPLOAD_BYTES = 16 * 1024 * 1024
     /** Marker kinds whose original content can go back to the composer. */
     const RESTORABLE = ['recall', 'edit']
 
@@ -63,21 +64,39 @@ window.__ModuleLoader__.load({
       return error
     }
 
+    function timeoutSignal(milliseconds) {
+      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        return { signal: AbortSignal.timeout(milliseconds), cancel: () => {} }
+      }
+      if (typeof AbortController !== 'undefined') {
+        const controller = new AbortController()
+        const timer = window.setTimeout(() => controller.abort(), milliseconds)
+        return { signal: controller.signal, cancel: () => window.clearTimeout(timer) }
+      }
+      return { signal: undefined, cancel: () => {} }
+    }
+
     async function callHost(op, body) {
       const send = async (base) => {
-        const response = await fetch(base + op, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body === undefined ? {} : body),
-        })
-        const text = await response.text()
-        let payload = null
+        const timeout = timeoutSignal(60000)
         try {
-          payload = JSON.parse(text)
-        } catch {
-          payload = null
+          const response = await fetch(base + op, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body === undefined ? {} : body),
+            ...(timeout.signal ? { signal: timeout.signal } : {}),
+          })
+          const text = await response.text()
+          let payload = null
+          try {
+            payload = JSON.parse(text)
+          } catch {
+            payload = null
+          }
+          return { response: response, payload: payload }
+        } finally {
+          timeout.cancel()
         }
-        return { response: response, payload: payload }
       }
       let result = await send(routeBase)
       if (result.payload === null && routeBase === 'api/dsh-rewind/') {
@@ -85,6 +104,9 @@ window.__ModuleLoader__.load({
         result = await send(routeBase)
       }
       if (result.payload === null) throw bridgeError('route-missing', '宿主接口不可用：' + op)
+      if (result.response && result.response.ok === false && result.payload.ok === true) {
+        throw bridgeError('http-failed', '宿主接口请求失败（HTTP ' + result.response.status + '）')
+      }
       if (result.payload.ok !== true) {
         const info = result.payload.error || {}
         throw bridgeError(typeof info.code === 'string' ? info.code : 'failed', info.message || '操作失败')
@@ -227,7 +249,22 @@ window.__ModuleLoader__.load({
     }
 
     function quoteAttribute(value) {
-      return '"' + String(value).split('"').join('') + '"'
+      let result = '"'
+      const text = String(value)
+      for (let index = 0; index < text.length; index += 1) {
+        const code = text.charCodeAt(index)
+        const character = text[index]
+        if (character === '\\' || character === '"') {
+          result += '\\' + character
+        } else if (code === 0) {
+          result += '\ufffd'
+        } else if (code <= 0x1f || code === 0x7f) {
+          result += '\\' + code.toString(16) + ' '
+        } else {
+          result += character
+        }
+      }
+      return result + '"'
     }
 
     function ruleFor(key) {
@@ -347,6 +384,10 @@ window.__ModuleLoader__.load({
       return Boolean(block) && (block.type === 'image' || block.type === 'file')
     }
 
+    const UPLOAD_PENDING = { pending: true, queued: true, waiting: true, uploading: true, processing: true }
+    const UPLOAD_READY = { ready: true, success: true, succeeded: true, done: true, complete: true, completed: true }
+    const UPLOAD_FAILED = { failed: true, error: true, canceled: true, cancelled: true }
+
     async function waitUploads(conversation, ids) {
       const store = conversation && conversation.fileUploads
       if (!store || typeof store.getSnapshot !== 'function' || ids.length === 0) {
@@ -354,25 +395,50 @@ window.__ModuleLoader__.load({
         return
       }
       const deadline = Date.now() + 12000
+      let sawKnownEntry = false
+      let gaveMissingGrace = false
       while (Date.now() < deadline) {
         const state = store.getSnapshot() || {}
         let pending = false
+        let missing = 0
         for (const id of ids) {
           const entry = state[id]
-          if (entry && entry.status === 'uploading') pending = true
+          if (!entry || typeof entry.status !== 'string') {
+            missing += 1
+            continue
+          }
+          sawKnownEntry = true
+          const status = entry.status.toLowerCase()
+          if (UPLOAD_FAILED[status]) {
+            throw bridgeError('upload-failed', '附件上传失败：' + status)
+          }
+          if (!UPLOAD_READY[status]) pending = true
         }
-        if (!pending) {
-          await sleep(80)
-          return
+        if (!pending && (missing === 0 || (!sawKnownEntry && missing === ids.length && gaveMissingGrace))) return
+        // Some DSH versions do not expose draft ids in fileUploads at all. Give
+        // that registry one refresh before treating it as an untracked upload.
+        if (!sawKnownEntry && missing === ids.length && !gaveMissingGrace) {
+          gaveMissingGrace = true
+          await sleep(240)
+          continue
         }
         await sleep(150)
       }
+      throw bridgeError(
+        'upload-timeout',
+        sawKnownEntry ? '附件上传超时，请稍后重试' : '无法确认附件上传状态，请稍后重试',
+      )
     }
 
-    async function sendNow(sessionId, ids, inputActions) {
-      const conversation = services.conversation()
-      if (conversation) await waitUploads(conversation, ids)
-      if (inputActions && typeof inputActions.submit === 'function') inputActions.submit()
+    async function sendNow(sessionId, ids, inputActions, isCurrent) {
+      try {
+        const conversation = services.conversation()
+        if (conversation) await waitUploads(conversation, ids)
+        if (isCurrent && !isCurrent()) return
+        if (inputActions && typeof inputActions.submit === 'function') inputActions.submit()
+      } catch (error) {
+        if (!isCurrent || isCurrent()) showToast('发送失败：' + (error && error.message ? error.message : String(error)))
+      }
     }
 
     /**
@@ -385,9 +451,11 @@ window.__ModuleLoader__.load({
       const sessionId = options.sessionId
       const inputActions = options.inputActions
       const blocks = Array.isArray(options.blocks) ? options.blocks : []
+      const isCurrent = options.isCurrent || (() => true)
       const text = textOfBlocks(blocks)
       const failed = []
       const outcome = { text: text !== '', attached: 0, ids: [], failed: failed, total: 0 }
+      if (!isCurrent()) return outcome
       if (text !== '' && inputActions && typeof inputActions.setDraft === 'function') {
         inputActions.setDraft(text)
       }
@@ -410,7 +478,7 @@ window.__ModuleLoader__.load({
           failed.push(attachmentLabel(block) + '：' + (error && error.message ? error.message : String(error)))
         }
       }
-      if (files.length === 0) return outcome
+      if (!isCurrent() || files.length === 0) return outcome
       const conversation = services.conversation()
       if (!conversation || typeof conversation.createDrafts !== 'function') {
         failed.push('附件通道不可用')
@@ -471,9 +539,11 @@ window.__ModuleLoader__.load({
       try {
         outcome = await refillComposer(options)
       } catch (error) {
+        if (options.isCurrent && !options.isCurrent()) return
         showToast(error && error.message ? error.message : '放回失败')
         return
       }
+      if (options.isCurrent && !options.isCurrent()) return
       const summary = describeRefill(outcome)
       if (summary === '') {
         showToast(outcome.failed.length > 0 ? '放回失败：' + outcome.failed[0] : '这条消息没有可放回的内容')
@@ -483,7 +553,7 @@ window.__ModuleLoader__.load({
       showToast('已放回输入框：' + summary, {
         label: '立即发送',
         run: () => {
-          void sendNow(options.sessionId, ids, options.inputActions)
+          void sendNow(options.sessionId, ids, options.inputActions, options.isCurrent)
         },
       })
       if (outcome.failed.length > 0) showToast('有附件未能放回：' + outcome.failed[0])
@@ -587,7 +657,7 @@ window.__ModuleLoader__.load({
 
     function mountDialog(options) {
       const backdrop = dom('div', { class: 'dsh-rw-backdrop' })
-      const card = dom('div', { class: 'dsh-rw-dialog', role: 'dialog', 'aria-modal': 'true' })
+      const card = dom('div', { class: 'dsh-rw-dialog', role: 'dialog', 'aria-modal': 'true', 'aria-label': options.title })
       card.appendChild(
         dom('div', { class: 'dsh-rw-dialog-head' }, [
           dom('div', { class: 'dsh-rw-dialog-title', text: options.title }),
@@ -605,7 +675,7 @@ window.__ModuleLoader__.load({
         if (event.key === 'Escape') {
           event.preventDefault()
           event.stopPropagation()
-          close()
+          dismiss()
           return
         }
         if (event.key !== 'Tab') return
@@ -622,6 +692,11 @@ window.__ModuleLoader__.load({
           event.preventDefault()
           first.focus()
         }
+      }
+
+      function dismiss() {
+        if (typeof options.canDismiss === 'function' && !options.canDismiss()) return
+        close()
       }
 
       function close() {
@@ -643,7 +718,7 @@ window.__ModuleLoader__.load({
       document.addEventListener('keydown', onKeyDown, true)
       backdrop.addEventListener('mousedown', function (event) {
         if (card.contains(event.target)) return
-        close()
+        dismiss()
       })
       /* Keep wheel/trackpad scrolling inside the dialog: the chat transcript
          behind the mask must not move while a dialog is open. */
@@ -671,57 +746,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function openRecallDialog(options) {
-      const assistant = options.role === 'assistant'
-      const errorLine = dom('div', { class: 'dsh-rw-error' })
-      errorLine.style.display = 'none'
-      const hint = dom('div', {
-        class: 'dsh-rw-hint',
-        text: assistant
-          ? '撤回后，这条回复以及它之后的内容会从模型上下文中移除。界面上它们会折叠成一行提示，之后继续对话时模型不会记得它们。'
-          : '撤回后，这条消息以及它之后的所有内容会从模型上下文中移除。界面上它们会折叠成一行提示，之后继续对话时模型不会记得它们。想重新发送，可以从那行提示里把文字和附件放回输入框。',
-      })
-      const cancelButton = dom('button', { type: 'button', class: 'dsh-rw-ghost', text: '取消' })
-      const confirmButton = dom('button', { type: 'button', class: 'dsh-rw-danger', text: '撤回' })
-      let busy = false
-      const handle = mountDialog({
-        title: assistant ? '撤回这条回复' : '撤回这条消息',
-        sub: '从模型上下文中移除',
-        body: [hint, errorLine],
-        footer: [dom('div', { class: 'dsh-rw-foot-spacer' }), cancelButton, confirmButton],
-        onClose: options.onClose,
-      })
-      cancelButton.addEventListener('click', function () {
-        handle.close()
-      })
-      confirmButton.addEventListener('click', function () {
-        if (busy) return
-        busy = true
-        confirmButton.disabled = true
-        cancelButton.disabled = true
-        confirmButton.textContent = '撤回中…'
-        errorLine.style.display = 'none'
-        void (async function () {
-          try {
-            const value = await callHost('recall', { sessionId: options.sessionId, seq: options.seq })
-            handle.close()
-            const count = value && typeof value.shadowed === 'number' ? value.shadowed : 0
-            showToast(count > 0 ? '已撤回，模型上下文里移除了 ' + count + ' 条内容' : '已撤回')
-          } catch (problem) {
-            errorLine.textContent = problem && problem.message ? problem.message : '撤回失败'
-            errorLine.style.display = ''
-            confirmButton.disabled = false
-            cancelButton.disabled = false
-            confirmButton.textContent = '撤回'
-          } finally {
-            busy = false
-          }
-        })()
-      })
-      confirmButton.focus()
-      return handle
-    }
-
     function openEditDialog(options) {
       const sessionId = options.sessionId
       const seq = options.seq
@@ -743,11 +767,12 @@ window.__ModuleLoader__.load({
       const textarea = dom('textarea', {
         class: 'dsh-rw-textarea',
         placeholder: '输入新的内容…',
+        'aria-label': '消息正文',
         spellcheck: 'false',
       })
       textarea.value = textOfBlocks(source)
       const chips = dom('div', { class: 'dsh-rw-files' })
-      const errorLine = dom('div', { class: 'dsh-rw-error' })
+      const errorLine = dom('div', { class: 'dsh-rw-error', role: 'alert' })
       errorLine.style.display = 'none'
       const hint = dom('div', {
         class: 'dsh-rw-hint',
@@ -762,6 +787,7 @@ window.__ModuleLoader__.load({
       const handle = mountDialog({
         title: '编辑消息',
         sub: '保存后重新发送',
+        canDismiss: () => !busy,
         body: [textarea, chips, hint, errorLine],
         footer: [
           filePicker,
@@ -787,6 +813,9 @@ window.__ModuleLoader__.load({
         saveButton.disabled = next
         cancelButton.disabled = next
         addButton.disabled = next
+        filePicker.disabled = next
+        textarea.disabled = next
+        for (const button of chips.querySelectorAll('button')) button.disabled = next
         saveButton.textContent = next ? '保存中…' : '保存并重新发送'
       }
 
@@ -796,6 +825,7 @@ window.__ModuleLoader__.load({
       }
 
       function removeItem(key) {
+        if (busy || handle.isClosed()) return
         for (let index = items.length - 1; index >= 0; index -= 1) {
           if (items[index].key === key) items.splice(index, 1)
         }
@@ -821,6 +851,7 @@ window.__ModuleLoader__.load({
             title: '移除这个附件',
             text: '×',
           })
+          remove.disabled = busy
           remove.addEventListener('click', function () {
             removeItem(item.key)
           })
@@ -830,6 +861,7 @@ window.__ModuleLoader__.load({
       }
 
       function addFiles(fileList) {
+        if (busy || handle.isClosed()) return
         const stamp = Date.now()
         let position = 0
         for (const file of fileList) {
@@ -871,43 +903,54 @@ window.__ModuleLoader__.load({
             } catch (problem) {
               item.preview = ''
             }
-            renderChips()
+            if (!handle.isClosed()) renderChips()
           })()
         }
       }
 
       async function save() {
-        if (busy) return
+        if (busy || handle.isClosed()) return
+        const text = textarea.value
+        const selected = items.slice()
         setBusy(true)
-        setError('');
+        setError('')
         try {
           const add = []
-          for (const item of items) {
+          for (const item of selected) {
             if (!item.file) continue
+            if (Number.isFinite(item.file.size) && item.file.size > MAX_UPLOAD_BYTES) {
+              throw bridgeError('attachment-too-large', '单个附件不能超过 16 MiB')
+            }
             const buffer = await item.file.arrayBuffer()
-            const payload = await callHost('upload', {
-              sessionId: sessionId,
-              kind: item.isImage ? 'image' : 'file',
-              name: item.file.name,
-              mediaType: item.file.type || 'application/octet-stream',
-              data: toBase64(new Uint8Array(buffer)),
+            if (buffer.byteLength > MAX_UPLOAD_BYTES) {
+              throw bridgeError('attachment-too-large', '单个附件不能超过 16 MiB')
+            }
+            if (handle.isClosed()) return
+            add.push({
+              type: item.isImage ? 'image' : 'file',
+              upload: {
+                name: item.file.name,
+                mediaType: item.file.type || 'application/octet-stream',
+                data: toBase64(new Uint8Array(buffer)),
+              },
             })
-            if (payload && payload.block) add.push(payload.block)
           }
+          if (handle.isClosed()) return
           const keep = []
-          for (const item of items) {
+          for (const item of selected) {
             if (item.file) continue
             const attachment = item.block ? item.block.attachment : null
             const id = attachment ? attachment.attachmentId : undefined
             if (typeof id === 'string') keep.push(id)
           }
-          await callHost('edit', {
+                    await callHost('edit', {
             sessionId: sessionId,
             seq: seq,
-            text: textarea.value,
+            text: text,
             keep: keep,
             add: add,
           })
+          if (handle.isClosed()) return
           handle.close()
           showToast('已保存并重新发送')
         } catch (problem) {
@@ -918,6 +961,7 @@ window.__ModuleLoader__.load({
       }
 
       textarea.addEventListener('keydown', function (event) {
+        if (event.isComposing || event.keyCode === 229) return
         if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
           event.preventDefault()
           void save()
@@ -977,42 +1021,35 @@ window.__ModuleLoader__.load({
     function UserActionsRow(props) {
       const node = props.node
       const sessionId = props.sessionId
-      const inputActions = props.inputActions
       const data = node && node.data ? node.data : {}
       const seq = data.seq
       const blocks = Array.isArray(data.content) ? data.content : []
       const rowKey = node ? node.key : ''
-      const [busy, setBusy] = useState(false)
-      const busyRef = useRef(false)
+      const dialog = useRef(null)
 
       useEffect(
         () => () => {
           actionRows.delete(rowKey)
+          if (dialog.current) dialog.current.close()
+          dialog.current = null
         },
-        [rowKey],
+        [sessionId, rowKey],
       )
+
+      const openEditor = () => {
+        if (dialog.current && !dialog.current.isClosed()) return
+        dialog.current = openEditDialog({
+          sessionId: sessionId,
+          seq: seq,
+          blocks: blocks,
+          onClose: () => { dialog.current = null },
+        })
+      }
 
       const attach = (element) => {
         if (element === null) actionRows.delete(rowKey)
         else actionRows.set(rowKey, element)
       }
-
-      const guard = async (task) => {
-        if (busyRef.current) return
-        busyRef.current = true
-        setBusy(true)
-        try {
-          await task()
-        } catch (error) {
-          showToast(error && error.message ? error.message : '操作失败')
-        } finally {
-          busyRef.current = false
-          setBusy(false)
-        }
-      }
-
-      const resend = () =>
-        guard(() => refillAndAnnounce({ sessionId: sessionId, inputActions: inputActions, blocks: blocks }))
 
       return h(
         'div',
@@ -1022,34 +1059,10 @@ window.__ModuleLoader__.load({
           {
             type: 'button',
             className: 'dsh-rw-btn',
-            disabled: busy,
             title: '编辑这条消息',
-            onClick: () => openEditDialog({ sessionId: sessionId, seq: seq, blocks: blocks }),
+            onClick: openEditor,
           },
           '编辑',
-        ),
-        h(
-          'button',
-          {
-            type: 'button',
-            className: 'dsh-rw-btn',
-            disabled: busy,
-            title: '把文字和全部附件放回输入框',
-            onClick: resend,
-          },
-          '重发',
-        ),
-        h(
-          'button',
-          {
-            type: 'button',
-            className: 'dsh-rw-btn',
-            'data-danger': 'true',
-            disabled: busy,
-            title: '撤回这条消息以及它之后的内容',
-            onClick: () => openRecallDialog({ sessionId: sessionId, seq: seq, role: 'user' }),
-          },
-          '撤回',
         ),
       )
     }
@@ -1078,15 +1091,6 @@ window.__ModuleLoader__.load({
         { viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: '1.5', strokeLinecap: 'round' },
         h('path', { d: 'M13 8a5 5 0 1 1-1.6-3.7' }),
         h('path', { d: 'M13 2.4V5.2h-2.8' }),
-      )
-    }
-
-    function iconUndo() {
-      return h(
-        'svg',
-        { viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: '1.5', strokeLinecap: 'round' },
-        h('path', { d: 'M3.5 8a4.5 4.5 0 0 1 9 0' }),
-        h('path', { d: 'M3.5 4.6V8h3.4' }),
       )
     }
 
@@ -1128,18 +1132,6 @@ window.__ModuleLoader__.load({
           },
           iconRefresh(),
         ),
-        h(
-          'button',
-          {
-            type: 'button',
-            className: 'dsh-rw-icon',
-            'data-danger': 'true',
-            disabled: busy || !ready,
-            title: '撤回这条回复以及它之后的内容',
-            onClick: () => openRecallDialog({ sessionId: sessionId, seq: seq, role: 'assistant' }),
-          },
-          iconUndo(),
-        ),
       )
     }
 
@@ -1178,6 +1170,14 @@ window.__ModuleLoader__.load({
       }, [css, rowKey])
 
       const source = useMemo(() => findUserDataAt(snapshot, startSeq), [snapshot, startSeq])
+      const [restoring, setRestoring] = useState(false)
+      const restoringRef = useRef(false)
+      const restoreContext = useRef(null)
+      useEffect(() => {
+        const context = {}
+        restoreContext.current = context
+        return () => { restoreContext.current = null }
+      }, [sessionId, inputActions, rowKey])
       const count = shadowed.length
 
       let label = '已撤回 ' + count + ' 条内容，模型不会再看到它们'
@@ -1185,12 +1185,22 @@ window.__ModuleLoader__.load({
       else if (kind === 'regenerate') label = '已重新生成，旧的 ' + count + ' 条内容已从上下文移除'
 
       const restore = async () => {
+        if (restoringRef.current) return
         if (!source) {
           showToast('原始内容已不在聊天记录里，无法放回')
           return
         }
-        const blocks = Array.isArray(source.content) ? source.content : []
-        await refillAndAnnounce({ sessionId: sessionId, inputActions: inputActions, blocks: blocks })
+        const context = restoreContext.current
+        const isCurrent = () => context !== null && restoreContext.current === context
+        restoringRef.current = true
+        setRestoring(true)
+        try {
+          const blocks = Array.isArray(source.content) ? source.content : []
+          await refillAndAnnounce({ sessionId: sessionId, inputActions: inputActions, blocks: blocks, isCurrent: isCurrent })
+        } finally {
+          restoringRef.current = false
+          if (restoreContext.current !== null) setRestoring(false)
+        }
       }
 
       return h(
@@ -1198,7 +1208,7 @@ window.__ModuleLoader__.load({
         { className: 'dsh-rw-marker' },
         h('div', { className: 'dsh-rw-marker-text' }, label),
         RESTORABLE.indexOf(kind) >= 0
-          ? h('button', { type: 'button', className: 'dsh-rw-chip', onClick: () => void restore() }, '放回输入框')
+          ? h('button', { type: 'button', className: 'dsh-rw-chip', disabled: restoring || !source, onClick: () => void restore() }, restoring ? '恢复中…' : '放回输入框')
           : null,
       )
     }
@@ -1230,7 +1240,7 @@ window.__ModuleLoader__.load({
         if (!event || event.type !== 'user/message') return null
         if (event.surfaceOp !== undefined && event.surfaceOp !== 'append') return null
         const source = event.data ? event.data.source : null
-        if (!source || (source.kind !== 'user' && source.kind !== 'goal')) return null
+        if (!source || source.kind !== 'user') return null
         const id = event.data.id
         if (typeof id !== 'string' || id === '') return null
         return { id: id, role: 'start' }
@@ -1326,6 +1336,7 @@ window.__ModuleLoader__.load({
         style.textContent = CSS
         document.head.appendChild(style)
         return () => {
+          closeAllDialogs()
           const live = document.getElementById(STYLE_ID)
           if (live !== null) live.remove()
           const hide = document.getElementById(HIDE_STYLE_ID)
@@ -1346,10 +1357,20 @@ window.__ModuleLoader__.load({
         if (definitionsRegistered) return true
         const registrar = conversationRegistrar(service)
         if (registrar === null) return false
-        let disposers
+        const disposers = []
         try {
-          disposers = [registrar.register(actionsDefinition), registrar.register(markerDefinition)]
+          const actionsDispose = registrar.register(actionsDefinition)
+          disposers.push(typeof actionsDispose === 'function' ? actionsDispose : () => {})
+          const markerDispose = registrar.register(markerDefinition)
+          disposers.push(typeof markerDispose === 'function' ? markerDispose : () => {})
         } catch (error) {
+          for (let index = disposers.length - 1; index >= 0; index -= 1) {
+            try {
+              disposers[index]()
+            } catch {
+              /* best effort rollback of a partial registration */
+            }
+          }
           log('conversation definitions failed (' + serviceName + '): ' + (error && error.message))
           return false
         }
@@ -1421,7 +1442,6 @@ window.__ModuleLoader__.load({
       HideSync: HideSync,
       mountDialog: mountDialog,
       openEditDialog: openEditDialog,
-      openRecallDialog: openRecallDialog,
       closeAllDialogs: closeAllDialogs,
       hiddenKeysFor: hiddenKeysFor,
       hideCss: hideCss,

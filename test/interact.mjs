@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
 
-const require = createRequire('/tmp/rendertest/')
+const require = createRequire(import.meta.url)
 const { JSDOM } = require('jsdom')
 
 const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
@@ -9,6 +9,18 @@ const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', 
   pretendToBeVisual: true,
 })
 const win = dom.window
+
+// jsdom omits Blob.arrayBuffer; provide the browser API through its FileReader.
+if (typeof win.Blob.prototype.arrayBuffer !== 'function') {
+  win.Blob.prototype.arrayBuffer = function () {
+    return new Promise((resolve, reject) => {
+      const reader = new win.FileReader()
+      reader.onload = () => resolve(reader.result)
+      reader.onerror = () => reject(reader.error)
+      reader.readAsArrayBuffer(this)
+    })
+  }
+}
 
 globalThis.window = win
 globalThis.document = win.document
@@ -31,18 +43,27 @@ const hostValue = (op) => {
   if (op === 'upload') {
     return { block: { type: 'image', attachment: { attachmentId: 'new-a', mediaType: 'image/png', name: 'extra.png' } } }
   }
-  if (op === 'recall') return { shadowed: 3 }
   if (op === 'edit') return { shadowed: 3, truncated: 2 }
   if (op === 'regenerate') return { shadowed: 2 }
   return {}
 }
+
+let hostHandler = hostValue
+let pendingHostRequests = 0
 
 const fetchStub = async (url, init) => {
   const target = String(url)
   const op = target.slice(target.lastIndexOf('/') + 1)
   const body = init && typeof init.body === 'string' ? JSON.parse(init.body) : {}
   calls.push({ op: op, body: body })
-  const payload = { ok: true, value: hostValue(op) }
+  pendingHostRequests += 1
+  let value
+  try {
+    value = await hostHandler(op, body)
+  } finally {
+    pendingHostRequests -= 1
+  }
+  const payload = { ok: true, value: value }
   return {
     ok: true,
     status: 200,
@@ -93,7 +114,7 @@ win.__ModuleLoader__ = {
   },
 }
 
-const source = fs.readFileSync('/Users/youngwu/Documents/code/dsh-rewind/client.js', 'utf8')
+const source = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8')
 const run = new Function('window', 'document', 'fetch', 'File', 'btoa', 'atob', 'console', source)
 run(
   win,
@@ -171,6 +192,80 @@ async function unmount() {
   calls.length = 0
 }
 
+async function waitFor(condition) {
+  const deadline = Date.now() + 2000
+  await act(async () => {
+    while (!condition()) {
+      if (Date.now() >= deadline) throw new Error('Timed out waiting for asynchronous UI')
+      await new Promise(resolve => win.setTimeout(resolve, 5))
+    }
+  })
+}
+
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  return { promise: promise, resolve: resolve }
+}
+
+async function flushAsync() {
+  await act(async () => {
+    await new Promise((resolve) => setImmediate(resolve))
+  })
+}
+
+async function releaseHost(gate) {
+  await act(async () => { gate.resolve() })
+  await waitFor(() => pendingHostRequests === 0)
+  await flushAsync()
+}
+
+async function selectFiles(input, files) {
+  Object.defineProperty(input, 'files', { value: files, configurable: true })
+  await act(async () => {
+    input.dispatchEvent(new win.Event('change', { bubbles: true }))
+  })
+}
+
+async function sendFiles(target, type, property, files) {
+  const event = new win.Event(type, { bubbles: true, cancelable: true })
+  Object.defineProperty(event, property, { value: { files: files } })
+  await act(async () => { target.dispatchEvent(event) })
+}
+
+const chipNames = (scope) => Array.from(scope.querySelectorAll('.dsh-rw-file-name'), (chip) => chip.textContent)
+const countCalls = (op) => calls.filter((call) => call.op === op).length
+
+function resetComposer() {
+  inputActions.drafts.length = 0
+  inputActions.attachments.length = 0
+  inputActions.submits = 0
+  conversationCalls.drafts.length = 0
+  conversationCalls.released.length = 0
+}
+
+// Hold the composer's next short upload-settle delay; toast timers remain real.
+function pauseComposerDelay() {
+  const original = win.setTimeout
+  let resume = null
+  win.setTimeout = function (callback, delay, ...args) {
+    if (delay === 80 && resume === null) {
+      resume = () => callback(...args)
+      return 0
+    }
+    return original.call(win, callback, delay, ...args)
+  }
+  return {
+    get paused() { return resume !== null },
+    release() {
+      win.setTimeout = original
+      const callback = resume
+      resume = null
+      if (callback !== null) callback()
+    },
+  }
+}
+
 async function click(element) {
   await act(async () => {
     element.dispatchEvent(new win.MouseEvent('click', { bubbles: true }))
@@ -218,10 +313,17 @@ const lastCall = (op) => {
 
 const box = await mount(userRow())
 check('action row has 编辑', buttonByText(box, '编辑') !== null, box.textContent)
+check('action row only has 编辑', box.querySelectorAll('button').length === 1 && buttonByText(box, '重发') === null && buttonByText(box, '撤回') === null, box.textContent)
 await click(buttonByText(box, '编辑'))
 
 const dialog = win.document.querySelector('.dsh-rw-dialog')
 check('edit dialog opens', dialog !== null, '')
+const dialogName = dialog && (dialog.getAttribute('aria-label') ||
+  (dialog.getAttribute('aria-labelledby') || '').split(/\s+/).map((id) => {
+    const label = win.document.getElementById(id)
+    return label ? label.textContent : ''
+  }).join(' '))
+check('edit dialog has an accessible name', dialogName && dialogName.trim() === '编辑消息', dialogName)
 check('dialog lives on document.body, outside the scroll container', dialog !== null && dialog.parentNode !== null && dialog.parentNode.parentNode === win.document.body, dialog && dialog.parentNode && dialog.parentNode.className)
 check('dialog is not a descendant of the message row', dialog !== null && !box.contains(dialog), '')
 const textarea = win.document.querySelector('textarea')
@@ -250,30 +352,117 @@ check('added file shows up as a chip', afterAdd.length === 2 && afterAdd.join(' 
 const saveButton = buttonByText(win.document.body, '保存并重新发送')
 check('save button present', saveButton !== null, '')
 await click(saveButton)
+await waitFor(() => win.document.querySelector('.dsh-rw-dialog') === null)
 
-const uploadCall = lastCall('upload')
 const editCall = lastCall('edit')
-check('edit uploads the new file first', uploadCall !== null && uploadCall.body.name === 'extra.png', uploadCall && JSON.stringify(uploadCall.body).slice(0, 120))
+check('edit does not create a standalone upload request', calls.filter((call) => call.op === 'upload').length === 0, JSON.stringify(calls))
 check('edit keeps the untouched attachment', editCall !== null && JSON.stringify(editCall.body.keep) === '["a1"]', editCall && JSON.stringify(editCall.body.keep))
 check('edit sends the new text', editCall !== null && editCall.body.text === '改成新的问题', editCall && editCall.body.text)
-check('edit sends the uploaded block', editCall !== null && editCall.body.add.length === 1 && editCall.body.add[0].attachment.attachmentId === 'new-a', editCall && JSON.stringify(editCall.body.add))
+check('edit sends the new file as a transactional upload spec', editCall !== null && editCall.body.add.length === 1 && editCall.body.add[0].upload.name === 'extra.png' && editCall.body.add[0].upload.data === 'ZXh0cmE=', editCall && JSON.stringify(editCall.body.add))
 check('edit targets the right message', editCall !== null && editCall.body.seq === 2 && editCall.body.sessionId === 's1', editCall && JSON.stringify({ seq: editCall.body.seq, sid: editCall.body.sessionId }))
 check('edit dialog closes after save', win.document.querySelector('.dsh-rw-dialog') === null, '')
 check('edit toast confirms', win.document.body.textContent.includes('已保存并重新发送'), win.document.body.textContent)
 await unmount()
 
-/* -------------------------------------------------------- recall flow --- */
+/* ---------------------------------------------------- busy edit guards --- */
 
-const recallBox = await mount(userRow())
-await click(buttonByText(recallBox, '撤回'))
-const recallDialog = win.document.querySelector('.dsh-rw-dialog')
-check('recall dialog opens', recallDialog !== null, '')
-check('recall dialog explains consequence', recallDialog !== null && recallDialog.textContent.includes('模型上下文中移除'), recallDialog && recallDialog.textContent.slice(0, 80))
-await click(win.document.querySelector('.dsh-rw-danger'))
-const recallCall = lastCall('recall')
-check('recall hits the host', recallCall !== null && recallCall.body.seq === 2, recallCall && JSON.stringify(recallCall.body))
-check('recall dialog closes', win.document.querySelector('.dsh-rw-dialog') === null, '')
-check('recall toast reports count', win.document.body.textContent.includes('已撤回，模型上下文里移除了 3 条内容'), win.document.body.textContent)
+const editsBeforeBusy = countCalls('edit')
+const editGate = deferred()
+hostHandler = async (op) => {
+  if (op === 'edit') await editGate.promise
+  return hostValue(op)
+}
+const busyHandle = T.openEditDialog({ sessionId: 's1', seq: 2, blocks: [userBlocks[0], userBlocks[2]] })
+const busyDialog = busyHandle.card
+const busyText = busyDialog.querySelector('textarea')
+const busyPicker = busyDialog.querySelector('input[type=file]')
+const savedText = '  保存快照：中文 👩🏽‍💻 é\n第二行  '
+await typeInto(busyText, savedText)
+await selectFiles(busyPicker, [
+  new win.File(['A'], 'A.txt', { type: 'text/plain' }),
+  new win.File(['B'], 'B.txt', { type: 'text/plain' }),
+])
+const busySave = buttonByText(busyDialog, '保存并重新发送')
+await click(busySave)
+await waitFor(() => countCalls('edit') === editsBeforeBusy + 1)
+check('busy edit disables the textarea', busyText.disabled, '')
+check('busy edit disables the file picker', busyPicker.disabled, '')
+check('busy edit disables every button', Array.from(busyDialog.querySelectorAll('button')).every((button) => button.disabled), busyDialog.innerHTML)
+const selectedNames = chipNames(busyDialog)
+const busyRemove = Array.from(busyDialog.querySelectorAll('.dsh-rw-file')).find((chip) => chip.textContent.includes('A.txt')).querySelector('button')
+// dispatchEvent also verifies handlers reject late input already queued before disabling.
+await click(busyRemove)
+check('busy remove leaves selected attachments unchanged', JSON.stringify(chipNames(busyDialog)) === JSON.stringify(selectedNames), chipNames(busyDialog))
+await sendFiles(busyDialog, 'drop', 'dataTransfer', [new win.File(['drop'], 'dropped.txt', { type: 'text/plain' })])
+check('busy drop cannot add attachments', JSON.stringify(chipNames(busyDialog)) === JSON.stringify(selectedNames), chipNames(busyDialog))
+await sendFiles(busyText, 'paste', 'clipboardData', [new win.File(['paste'], 'pasted.txt', { type: 'text/plain' })])
+check('busy paste cannot add attachments', JSON.stringify(chipNames(busyDialog)) === JSON.stringify(selectedNames), chipNames(busyDialog))
+await selectFiles(busyPicker, [new win.File(['change'], 'changed.txt', { type: 'text/plain' })])
+check('busy file change cannot add attachments', JSON.stringify(chipNames(busyDialog)) === JSON.stringify(selectedNames), chipNames(busyDialog))
+await act(async () => {
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+})
+check('busy Escape cannot dismiss the dialog', busyDialog.isConnected, '')
+await act(async () => {
+  busyDialog.parentNode.dispatchEvent(new win.MouseEvent('mousedown', { bubbles: true }))
+})
+check('busy backdrop cannot dismiss the dialog', busyDialog.isConnected, '')
+await click(busySave)
+await act(async () => {
+  busyText.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }))
+})
+check('busy repeated save does not start another edit', countCalls('edit') === editsBeforeBusy + 1, JSON.stringify(calls))
+// A disabled control can still be changed by scripts; the pending submission owns its original snapshot.
+await typeInto(busyText, '较晚的程序修改')
+await releaseHost(editGate)
+await waitFor(() => !busyDialog.isConnected)
+const busyEdit = lastCall('edit')
+check('busy save submits once', countCalls('edit') === editsBeforeBusy + 1, JSON.stringify(calls))
+check('busy save preserves the exact text snapshot including Unicode and whitespace', busyEdit && busyEdit.body.text === savedText, busyEdit && busyEdit.body.text)
+check('busy save preserves retained attachments', busyEdit && JSON.stringify(busyEdit.body.keep) === '["a2"]', busyEdit && JSON.stringify(busyEdit.body.keep))
+check('busy save sends both selected new files as upload specs exactly once', JSON.stringify(busyEdit && busyEdit.body.add.map((block) => block.upload.name)) === '["A.txt","B.txt"]', busyEdit && JSON.stringify(busyEdit.body.add))
+check('busy save makes no standalone upload calls', calls.filter((call) => call.op === 'upload').length === 0, JSON.stringify(calls))
+hostHandler = hostValue
+await unmount()
+
+/* ---------------------------------------------------- forced close guard --- */
+
+const closedEditGate = deferred()
+const editsBeforeClose = countCalls('edit')
+hostHandler = async (op) => {
+  if (op === 'edit') await closedEditGate.promise
+  return hostValue(op)
+}
+const closedHandle = T.openEditDialog({ sessionId: 's1', seq: 2, blocks: [userBlocks[0]] })
+await selectFiles(closedHandle.card.querySelector('input[type=file]'), [new win.File(['late'], 'late.txt', { type: 'text/plain' })])
+await click(buttonByText(closedHandle.card, '保存并重新发送'))
+await waitFor(() => countCalls('edit') === editsBeforeClose + 1)
+await act(async () => { T.closeAllDialogs() })
+check('closeAllDialogs force-closes a busy edit', !closedHandle.card.isConnected, '')
+await releaseHost(closedEditGate)
+check('a force-closed edit does not announce a successful edit', !win.document.body.textContent.includes('已保存并重新发送'), win.document.body.textContent)
+hostHandler = hostValue
+await unmount()
+
+/* ---------------------------------------------------- composition guard --- */
+
+const imeHandle = T.openEditDialog({ sessionId: 's1', seq: 2, blocks: [{ type: 'text', text: '初始文本' }] })
+const imeText = imeHandle.card.querySelector('textarea')
+await typeInto(imeText, 'han')
+await act(async () => {
+  for (const modifier of ['ctrlKey', 'metaKey']) {
+    imeText.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Enter', [modifier]: true, isComposing: true, bubbles: true, cancelable: true }))
+  }
+  imeText.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, keyCode: 229, bubbles: true, cancelable: true }))
+})
+await flushAsync()
+check('IME Ctrl/Meta+Enter and legacy composition events do not submit', countCalls('edit') === 0 && imeHandle.card.isConnected, JSON.stringify(calls))
+await typeInto(imeText, '汉字完成 👩🏽‍💻')
+await act(async () => {
+  imeText.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }))
+})
+await waitFor(() => !imeHandle.card.isConnected)
+check('normal Ctrl+Enter submits once after composition', countCalls('edit') === 1 && lastCall('edit').body.text === '汉字完成 👩🏽‍💻', JSON.stringify(calls))
 await unmount()
 
 /* ---------------------------------------------------- escape + cancel --- */
@@ -287,22 +476,18 @@ await act(async () => {
 check('escape closes the dialog', win.document.querySelector('.dsh-rw-dialog') === null, '')
 await unmount()
 
-/* -------------------------------------------------------- resend flow --- */
+/* -------------------------------------------------------- unchanged edit --- */
 
-const resendBox = await mount(userRow())
-await click(buttonByText(resendBox, '重发'))
-check('resend restores the text', inputActions.drafts.length === 1 && inputActions.drafts[0] === '看看这张图和笔记', inputActions.drafts.join(' | '))
-check('resend rebuilds every attachment', conversationCalls.drafts.length === 1 && conversationCalls.drafts[0].names.length === 2, JSON.stringify(conversationCalls.drafts))
-check('resend puts attachment ids into the composer', inputActions.attachments.length === 1 && inputActions.attachments[0].length === 2, JSON.stringify(inputActions.attachments))
-const toast = win.document.body.querySelector('.dsh-rw-toast')
-check('resend toast names text and attachments', toast !== null && toast.textContent.includes('已放回输入框：文字、2 个附件'), toast && toast.textContent)
-const sendNowButton = toast && toast.querySelector('.dsh-rw-toast-action')
-check('resend toast offers 立即发送', sendNowButton !== null && sendNowButton.textContent === '立即发送', sendNowButton && sendNowButton.textContent)
-await click(sendNowButton)
-await act(async () => {
-  await new Promise((resolve) => win.setTimeout(resolve, 320))
-})
-check('立即发送 submits the composer', inputActions.submits === 1, inputActions.submits)
+const unchangedBox = await mount(userRow())
+await click(buttonByText(unchangedBox, '编辑'))
+const editCountBefore = calls.filter((call) => call.op === 'edit').length
+await click(buttonByText(win.document.body, '保存并重新发送'))
+const unchangedEdit = lastCall('edit')
+check('unchanged edit still submits', calls.filter((call) => call.op === 'edit').length === editCountBefore + 1, calls.length)
+check('unchanged edit sends original text', unchangedEdit.body.text === userBlocks[0].text, unchangedEdit.body.text)
+check('unchanged edit keeps every attachment', JSON.stringify(unchangedEdit.body.keep) === '["a1","a2"]', JSON.stringify(unchangedEdit.body.keep))
+check('unchanged edit adds no attachments', unchangedEdit.body.add.length === 0, JSON.stringify(unchangedEdit.body.add))
+check('unchanged edit dialog closes', win.document.querySelector('.dsh-rw-dialog') === null, '')
 await unmount()
 
 /* ------------------------------------------------- assistant actions --- */
@@ -319,13 +504,10 @@ const assistantBox = await mount(
   React.createElement(T.AssistantActions, { messageId: 'm1', sessionId: 's1', useChat: useChat, t: (key) => key }),
 )
 const icons = assistantBox.querySelectorAll('button')
-check('assistant row has two icon buttons', icons.length === 2, icons.length)
+check('assistant row only has regeneration', icons.length === 1 && icons[0].title === '重新生成这条回复', assistantBox.innerHTML)
 await click(icons[0])
 const regenCall = lastCall('regenerate')
 check('regenerate hits the host with the assistant seq', regenCall !== null && regenCall.body.seq === 4, regenCall && JSON.stringify(regenCall.body))
-await click(icons[1])
-check('assistant recall opens a dialog', win.document.querySelector('.dsh-rw-dialog') !== null, '')
-check('assistant recall dialog says 撤回这条回复', win.document.body.textContent.includes('撤回这条回复'), '')
 await unmount()
 
 /* -------------------------------------------------------- marker row --- */
@@ -359,6 +541,14 @@ conversationCalls.drafts.length = 0
 await click(buttonByText(markerBox, '放回输入框'))
 check('marker refill restores text', inputActions.drafts[0] === '看看这张图和笔记', inputActions.drafts.join(' | '))
 check('marker refill restores attachments', conversationCalls.drafts.length === 1 && conversationCalls.drafts[0].names.length === 2, JSON.stringify(conversationCalls.drafts))
+check('marker refill puts attachment ids into the composer', inputActions.attachments.length === 1 && inputActions.attachments[0].length === 2, JSON.stringify(inputActions.attachments))
+const toast = win.document.body.querySelector('.dsh-rw-toast')
+check('marker refill toast names text and attachments', toast !== null && toast.textContent.includes('已放回输入框：文字、2 个附件'), toast && toast.textContent)
+const sendNowButton = toast && toast.querySelector('.dsh-rw-toast-action')
+check('marker refill toast offers 立即发送', sendNowButton !== null && sendNowButton.textContent === '立即发送', sendNowButton && sendNowButton.textContent)
+await click(sendNowButton)
+await waitFor(() => inputActions.submits === 1)
+check('立即发送 submits the composer', inputActions.submits === 1, inputActions.submits)
 await unmount()
 
 /* -------------------------------------------------------------- report --- */

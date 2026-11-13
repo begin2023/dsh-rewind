@@ -1,7 +1,7 @@
 
 import fs from 'node:fs'
 
-const code = fs.readFileSync('/Users/youngwu/Documents/code/dsh-rewind/client.js', 'utf8')
+const code = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8')
 
 const created = []
 const headChildren = []
@@ -50,7 +50,8 @@ run(window, document, () => { throw new Error('fetch should not run') }, class F
 const results = []
 const check = (name, ok, detail) => results.push({ name, ok: Boolean(ok), detail })
 
-check('module id', factoryResult !== null && factoryResult.__id === 'dsh-rewind', String(factoryResult && factoryResult.__id))
+const packageName = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).name
+check('module id matches the package manifest', factoryResult !== null && factoryResult.__id === packageName, String(factoryResult && factoryResult.__id))
 check('module inject', Array.isArray(factoryResult.inject) && factoryResult.inject.includes('slots'))
 check('apply exported', typeof factoryResult.apply === 'function')
 
@@ -91,6 +92,7 @@ check('actions match append', matched && matched.id === 'm1' && matched.role ===
 check('actions skip replacement', test.actionsDefinition.match({ ...userEvent, surfaceOp: { op: 'replace', startSeq: 1, endSeq: 2 } }) === null)
 check('actions skip assistant', test.actionsDefinition.match({ seq: 3, type: 'assistant/message', data: { id: 'a1', content: [] } }) === null)
 check('actions skip tool source', test.actionsDefinition.match({ ...userEvent, data: { ...userEvent.data, source: { kind: 'tool' } } }) === null)
+check('actions skip automatic goal input', test.actionsDefinition.match({ ...userEvent, data: { ...userEvent.data, source: { kind: 'goal' } } }) === null)
 
 const node = test.actionsDefinition.buildViewNode({ key: '15:rewind-actionsm1', id: 'm1', state: { seq: 2 } })
 check('actions node location', node.location.kind === 'unresolved' && node.anchorSeq === 2 && node.target === 'chat')
@@ -120,6 +122,10 @@ check('hidden keys partial turn keeps header', test.hiddenKeysFor([2], nodes).in
 
 const css = test.hideCss([2, 3], { nodes })
 check('hide css has rules', css.includes('data-chat-node-key="13:input-messageu1"') && css.includes('display:none!important'), css.slice(0, 120))
+const hostileKey = 'bad"\\' + String.fromCharCode(10, 1)
+const hostileNodes = new Map([['hostile', { key: hostileKey, kind: 'user', anchorSeq: 2, visibility: 'visible', data: { seq: 2 }, location: { turn: { turn: 1 } } }]])
+const hostileCss = test.hideCss([2], { nodes: hostileNodes })
+check('hide css escapes hostile selector data', hostileCss.includes(String.fromCharCode(92, 34)) && hostileCss.includes(String.fromCharCode(92, 92)) && hostileCss.includes(String.fromCharCode(92, 97, 32)) && hostileCss.includes(String.fromCharCode(92, 49, 32)) && !hostileCss.includes(String.fromCharCode(10)), hostileCss)
 check('hide css empty for none', test.hideCss([], { nodes }) === '')
 
 const snapshotNodes = new Map()

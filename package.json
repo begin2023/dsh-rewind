@@ -1,19 +1,40 @@
 {
-  "name": "dsh-rewind",
+  "name": "@begin2023/dsh-rewind",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "DSH 插件：对会话里任意一条消息做编辑 / 撤回 / 重发 / 重新生成，图片与文件不丢。",
+  "license": "MIT",
+  "author": {
+    "name": "begin2023"
+  },
+  "homepage": "https://github.com/begin2023/dsh-rewind#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/begin2023/dsh-rewind.git"
+  },
+  "bugs": {
+    "url": "https://github.com/begin2023/dsh-rewind/issues"
+  },
+  "keywords": ["dsh", "dsh-plugin", "deepseek", "deepseek-harness", "conversation", "message-editing", "regenerate", "attachments"],
+  "description": "DSH 插件：编辑用户消息、重新生成助手回复，保留图片与文件。",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js"
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
     "client.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+    "icon.svg",
+    "locale",
+    "docs"
   ],
   "dsh": {
     "bundle": {
@@ -29,10 +50,18 @@
     }
   },
   "scripts": {
-    "test": "node test/smoke.mjs && node test/host.mjs && node test/render.mjs && node test/interact.mjs"
+    "check": "node --check index.js && node --check client.js",
+    "test": "node test/smoke.mjs && node test/host.mjs && node test/render.mjs && node test/interact.mjs",
+    "test:consumer": "node test/pack-consumer.mjs",
+    "prepack": "npm run check && npm test"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
   },
   "peerDependencies": {
-    "react": "^18.2.0"
+    "react": "^18.2.0 || ^19.0.0"
   },
   "peerDependenciesMeta": {
     "react": {
@@ -41,5 +70,9 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   }
 }

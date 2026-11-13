@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Conversation rewind",
+    "description": "Edit sent user messages and attachments, regenerate assistant replies, and continue from the revision while preserving earlier context and historical events.",
+    "detail": "docs/DETAIL.md"
+  }
+}

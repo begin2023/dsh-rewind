@@ -1,13 +1,13 @@
 /**
  * dsh-rewind — host half.
  *
- * Applies message editing, recall (withdrawal) and regeneration to a live DSH
- * session by appending surface replacement events and, where a new turn is
- * needed, handing an already-admitted user message to the session agent.
+ * Applies message editing and regeneration to a live DSH session by appending
+ * surface replacement events and handing an already-admitted user message to
+ * the session agent.
  *
  * Design notes
  * ------------
- * - Only official session event types are ever written. A withdrawal / edit is
+ * - Only official session event types are ever written. Each replacement is
  *   a `system/message` event with empty content carrying a
  *   `surfaceOp: { op: 'replace', startSeq, endSeq }`. Empty content makes
  *   `deriveEventMessage` return null, so the replacement contributes no
@@ -30,6 +30,9 @@ export const inject = ['connection']
 const ROUTE_PREFIX = '/api/dsh-rewind'
 const MARKER_PREFIX = 'rewind:'
 const IDLE_TIMEOUT_MS = 6000
+const MAX_REQUEST_BYTES = 32 * 1024 * 1024
+const MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024
+const MAX_BASE64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4
 
 /* ------------------------------------------------------------------ */
 /* plumbing                                                            */
@@ -62,21 +65,61 @@ function failWith(error) {
   })
 }
 
+function declaredRequestBytes(request) {
+  const headers = request && request.headers
+  if (!headers || typeof headers.get !== 'function') return null
+  const value = Number(headers.get('content-length'))
+  return Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+async function readRequestText(request) {
+  if (request && request.body && typeof request.body.getReader === 'function') {
+    const reader = request.body.getReader()
+    const chunks = []
+    let total = 0
+    try {
+      while (true) {
+        const part = await reader.read()
+        if (!part || part.done) break
+        let chunk
+        try {
+          if (part.value instanceof ArrayBuffer) chunk = Buffer.from(new Uint8Array(part.value))
+          else chunk = Buffer.from(part.value)
+        } catch {
+          throw rewindError('invalid-body', 'request body is not readable')
+        }
+        total += chunk.byteLength
+        if (total > MAX_REQUEST_BYTES) throw rewindError('request-too-large', '请求体超过 32 MiB 限制')
+        chunks.push(chunk)
+      }
+      return Buffer.concat(chunks, total).toString('utf8')
+    } finally {
+      if (typeof reader.releaseLock === 'function') reader.releaseLock()
+    }
+  }
+  return typeof request?.text === 'function' ? await request.text() : ''
+}
+
 async function readJsonBody(request) {
-  const text = typeof request.text === 'function' ? await request.text() : ''
+  const declaredBytes = declaredRequestBytes(request)
+  if (declaredBytes !== null && declaredBytes > MAX_REQUEST_BYTES) {
+    throw rewindError('request-too-large', '请求体超过 32 MiB 限制')
+  }
+  const text = await readRequestText(request)
+  if (Buffer.byteLength(text, 'utf8') > MAX_REQUEST_BYTES) {
+    throw rewindError('request-too-large', '请求体超过 32 MiB 限制')
+  }
   if (!text || text.trim() === '') return {}
+  let body
   try {
-    return JSON.parse(text)
+    body = JSON.parse(text)
   } catch {
     throw rewindError('invalid-body', 'request body is not JSON')
   }
-}
-
-function delay(ms) {
-  return new Promise(resolve => {
-    const timer = setTimeout(resolve, ms)
-    if (typeof timer === 'object' && timer !== null && typeof timer.unref === 'function') timer.unref()
-  })
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw rewindError('invalid-body', 'request body must be a JSON object')
+  }
+  return body
 }
 
 /* ------------------------------------------------------------------ */
@@ -244,28 +287,89 @@ async function flushSession(ctx, session) {
   if (sessions && typeof sessions.flush === 'function') {
     try {
       await sessions.flush(session)
-    } catch {
-      /* flush is best effort; the append already landed in memory */
+    } catch (error) {
+      // The append is already in memory, so report the persistence boundary
+      // explicitly instead of claiming that the operation completed.
+      throw rewindError('flush-failed', error instanceof Error ? error.message : String(error))
     }
   }
 }
 
-async function ensureIdle(ctx, sessionId) {
-  const agents = ctx.get('agents')
-  const agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : undefined
-  if (!agent) return
-  try {
-    if (agent.status !== 'running') return
-    if (typeof agent.cancel === 'function') agent.cancel({ kind: 'user' })
-    if (typeof agent.whenIdle === 'function') {
-      await Promise.race([agent.whenIdle(), delay(IDLE_TIMEOUT_MS)])
-    }
-  } catch {
-    /* a still-running turn costs us ordering, not correctness */
+function assertNoPendingInput(agent) {
+  if (agent.inbox && agent.inbox.hasPending) {
+    throw rewindError('pending-input', '该会话还有排队中的输入，请先处理后再编辑或重新生成')
   }
+}
+
+async function ensureIdle(agent) {
+  assertNoPendingInput(agent)
+  if (agent.status === 'running') {
+    if (typeof agent.cancel !== 'function') throw rewindError('session-busy', '无法停止当前生成')
+    // Never discard a queued message if one arrives during cancellation. A broken
+    // cancellation must also have a bound; otherwise the route can hang forever.
+    let cancelTimer
+    try {
+      const cancellation = agent.cancel({ kind: 'user' }, { keepInbox: true })
+      await Promise.race([
+        Promise.resolve(cancellation),
+        new Promise((_, reject) => {
+          cancelTimer = setTimeout(() => reject(rewindError('cancel-timeout', '停止生成超时，未修改会话历史')), IDLE_TIMEOUT_MS)
+        }),
+      ])
+    } catch (error) {
+      if (error && error.code === 'cancel-timeout') throw error
+      throw rewindError('cancel-failed', error instanceof Error ? error.message : String(error))
+    } finally {
+      clearTimeout(cancelTimer)
+    }
+  }
+  if (typeof agent.whenIdle !== 'function') throw rewindError('idle-unavailable', '无法确认会话已停止')
+  let timer
+  try {
+    // Maintenance can report idle while it still owns the session: always drain it.
+    await Promise.race([
+      agent.whenIdle(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(rewindError('idle-timeout', '停止生成超时，未修改会话历史')), IDLE_TIMEOUT_MS)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+  if (agent.status !== 'idle') throw rewindError('session-busy', '该会话仍在生成，未修改会话历史')
+  assertNoPendingInput(agent)
+}
+
+function assertMutationReady(ctx, sessionId, session, agent) {
+  if (requireSession(ctx, sessionId) !== session || requireAgent(ctx, sessionId) !== agent) {
+    throw rewindError('session-changed', '会话已重新加载，请刷新后重试')
+  }
+  if (agent.status !== 'idle') throw rewindError('session-busy', '该会话开始了新的生成，请稍后重试')
+  assertNoPendingInput(agent)
 }
 
 const MESSAGE_BLOCK_TYPES = new Set(['text', 'image', 'file'])
+
+function attachmentBytes(value) {
+  const bytes = value && Number(value.byteLength)
+  return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null
+}
+
+function checkedAttachmentBytes(value) {
+  const bytes = attachmentBytes(value)
+  if (bytes === null) throw rewindError('invalid-attachment', '附件读取结果无效')
+  if (bytes > MAX_ATTACHMENT_BYTES) throw rewindError('attachment-too-large', '单个附件不能超过 16 MiB')
+  return bytes
+}
+
+function decodeBase64(value) {
+  if (typeof value !== 'string') throw rewindError('invalid-attachment', '附件内容不是有效的 Base64')
+  if (value.length > MAX_BASE64_CHARS) throw rewindError('attachment-too-large', '单个附件不能超过 16 MiB')
+  const data = Buffer.from(value, 'base64')
+  if (data.toString('base64') !== value) throw rewindError('invalid-attachment', '附件内容不是有效的 Base64')
+  if (data.byteLength > MAX_ATTACHMENT_BYTES) throw rewindError('attachment-too-large', '单个附件不能超过 16 MiB')
+  return data
+}
 
 function normaliseBlocks(blocks) {
   if (!Array.isArray(blocks)) return []
@@ -279,6 +383,17 @@ function normaliseBlocks(blocks) {
     }
     if (block.attachment && typeof block.attachment === 'object') {
       kept.push({ type: block.type, attachment: block.attachment })
+      continue
+    }
+    if (block.upload && typeof block.upload === 'object' && typeof block.upload.data === 'string') {
+      kept.push({
+        type: block.type,
+        upload: {
+          data: block.upload.data,
+          name: typeof block.upload.name === 'string' ? block.upload.name : 'attachment',
+          mediaType: typeof block.upload.mediaType === 'string' ? block.upload.mediaType : 'application/octet-stream',
+        },
+      })
     }
   }
   return kept
@@ -286,8 +401,8 @@ function normaliseBlocks(blocks) {
 
 function userBlocksOf(session, seq) {
   const event = eventAt(session, seq)
-  if (!event || event.type !== 'user/message') return null
-  return normaliseBlocks(event.data ? event.data.content : undefined)
+  if (!event || event.type !== 'user/message' || event.data?.source?.kind !== 'user') return null
+  return normaliseBlocks(event.data.content)
 }
 
 function textOfBlocks(blocks) {
@@ -305,35 +420,139 @@ function attachmentIdOf(block) {
 
 async function admit(ctx, content) {
   const attachments = ctx.get('attachments')
-  if (attachments && typeof attachments.admitPromptContent === 'function') {
-    return await attachments.admitPromptContent(content)
+  const parts = []
+  for (const block of content) {
+    if (block.type === 'text') {
+      parts.push(block)
+      continue
+    }
+    if (!attachments) throw rewindError('attachments-unavailable', '附件服务不可用')
+    if (block.type === 'image') {
+      if (typeof attachments.readImage !== 'function') throw rewindError('unsupported', '当前附件存储不支持读取图片')
+      const stored = await attachments.readImage(block.attachment)
+      const bytes = checkedAttachmentBytes(stored && stored.data)
+      parts.push({
+        type: 'image',
+        attachment: { ...block.attachment, ...(stored.ref || stored.attachment || {}) },
+        encodedBytes: bytes,
+      })
+    } else {
+      if (typeof attachments.readFileStream !== 'function') throw rewindError('unsupported', '当前附件存储不支持读取文件')
+      // Drain the verified stream before changing history; missing files must fail here.
+      let total = 0
+      for await (const chunk of attachments.readFileStream(block.attachment)) {
+        const bytes = attachmentBytes(chunk)
+        if (bytes === null) throw rewindError('invalid-attachment', '附件读取结果无效')
+        total += bytes
+        if (total > MAX_ATTACHMENT_BYTES) throw rewindError('attachment-too-large', '单个附件不能超过 16 MiB')
+      }
+      parts.push(block)
+    }
   }
-  return content
+  const admitted = attachments && typeof attachments.admitPromptContent === 'function'
+    ? await attachments.admitPromptContent(parts)
+    : parts
+  // encodedBytes is admission metadata, not a persisted model-content field.
+  return normaliseBlocks(admitted)
 }
 
-async function sendUserMessage(ctx, sessionId, content) {
-  const agent = requireAgent(ctx, sessionId)
-  const admitted = await admit(ctx, content)
-  const message = {
-    id: randomUUID(),
-    role: 'user',
-    content: admitted,
-    source: { kind: 'user', rpcId: randomUUID() },
+async function discardCreatedAttachments(ctx, created) {
+  const attachments = ctx.get('attachments')
+  if (!attachments || !Array.isArray(created)) return
+  for (let index = created.length - 1; index >= 0; index -= 1) {
+    const item = created[index]
+    const method = item.kind === 'image'
+      ? (attachments.deleteImage || attachments.removeImage)
+      : (attachments.deleteFile || attachments.removeFile)
+    if (typeof method !== 'function') continue
+    try {
+      await method.call(attachments, item.ref)
+    } catch {
+      /* Cleanup is best effort; the original operation error is more useful. */
+    }
   }
-  agent.followup(message)
-  return { blocks: admitted.length }
+}
+
+async function materialiseUploads(ctx, content) {
+  const attachments = ctx.get('attachments')
+  const materialised = []
+  const created = []
+  try {
+    for (const block of content) {
+      if (!block.upload) {
+        materialised.push(block)
+        continue
+      }
+      if (!attachments) throw rewindError('attachments-unavailable', '附件服务不可用')
+      const data = decodeBase64(block.upload.data)
+      const name = block.upload.name || 'attachment'
+      let ref
+      if (block.type === 'image') {
+        if (typeof attachments.saveImage !== 'function') throw rewindError('unsupported', '当前附件存储不支持保存图片')
+        ref = await attachments.saveImage({ data, mediaType: block.upload.mediaType || 'image/png', name })
+      } else {
+        if (typeof attachments.saveFile !== 'function') throw rewindError('unsupported', '当前附件存储不支持保存文件')
+        ref = await attachments.saveFile({ data, mediaType: block.upload.mediaType, name })
+      }
+      if (!ref || typeof ref !== 'object') throw rewindError('attachment-save-failed', '附件保存失败')
+      created.push({ kind: block.type, ref })
+      materialised.push({ type: block.type, attachment: ref })
+    }
+  } catch (error) {
+    await discardCreatedAttachments(ctx, created)
+    throw error
+  }
+  return { content: materialised, created }
+}
+
+async function prepareUserMessage(ctx, content) {
+  const prepared = await materialiseUploads(ctx, content)
+  try {
+    const admitted = await admit(ctx, prepared.content)
+    if (!Array.isArray(admitted) || admitted.length === 0) {
+      throw rewindError('empty-message', '消息不能为空')
+    }
+    return {
+      message: {
+        id: randomUUID(),
+        role: 'user',
+        content: admitted,
+        source: { kind: 'user', rpcId: randomUUID() },
+      },
+      created: prepared.created,
+    }
+  } catch (error) {
+    await discardCreatedAttachments(ctx, prepared.created)
+    throw error
+  }
 }
 
 /* ------------------------------------------------------------------ */
 /* operations                                                          */
 /* ------------------------------------------------------------------ */
 
+async function queueFollowup(agent, message) {
+  let result
+  try {
+    result = agent.followup(message)
+  } catch (error) {
+    throw rewindError('followup-failed', error instanceof Error ? error.message : String(error))
+  }
+  try {
+    // A synchronous followup is accepted immediately; await also captures
+    // hosts that return a promise for asynchronous queue admission.
+    await result
+  } catch (error) {
+    throw rewindError('followup-failed', error instanceof Error ? error.message : String(error))
+  }
+}
+
 async function opEdit(ctx, body) {
   const sessionId = body.sessionId
   const session = requireSession(ctx, sessionId)
-  const seq = Number(body.seq)
-  if (!Number.isFinite(seq)) throw rewindError('invalid-seq', '缺少消息位置')
-  const text = typeof body.text === 'string' ? body.text.trim() : ''
+  const seq = body.seq
+  if (!Number.isSafeInteger(seq) || seq < 0) throw rewindError('invalid-seq', '缺少有效的消息位置')
+  const text = typeof body.text === 'string' ? body.text : ''
   const original = userBlocksOf(session, seq)
   if (original === null) throw rewindError('not-a-user-message', '只有用户消息可以编辑')
 
@@ -348,35 +567,43 @@ async function opEdit(ctx, body) {
   if (Array.isArray(body.add)) {
     for (const block of normaliseBlocks(body.add)) content.push(block)
   }
-  if (text !== '') content.unshift({ type: 'text', text })
+  if (text.trim() !== '') content.unshift({ type: 'text', text })
   if (content.length === 0) throw rewindError('empty-message', '消息不能为空')
 
-  await ensureIdle(ctx, sessionId)
-  const span = shadowSpan(session, seq)
-  writeShadow(session, 'edit', span)
-  await flushSession(ctx, session)
-  const sent = await sendUserMessage(ctx, sessionId, content)
-  return { shadowed: span.shadowed.length, blocks: sent.blocks }
-}
-
-async function opRecall(ctx, body) {
-  const sessionId = body.sessionId
-  const session = requireSession(ctx, sessionId)
-  const seq = Number(body.seq)
-  if (!Number.isFinite(seq)) throw rewindError('invalid-seq', '缺少消息位置')
-  await ensureIdle(ctx, sessionId)
-  const span = shadowSpan(session, seq)
-  writeShadow(session, 'recall', span)
-  await flushSession(ctx, session)
-  return { shadowed: span.shadowed.length }
+  shadowSpan(session, seq) // Reject stale targets before stopping generation.
+  const agent = requireAgent(ctx, sessionId)
+  await ensureIdle(agent)
+  assertMutationReady(ctx, sessionId, session, agent)
+  let prepared
+  let queued = false
+  try {
+    prepared = await prepareUserMessage(ctx, content)
+    assertMutationReady(ctx, sessionId, session, agent)
+    const span = shadowSpan(session, seq)
+    // Queue first: a failed followup must leave the old history visible.
+    await queueFollowup(agent, prepared.message)
+    queued = true
+    writeShadow(session, 'edit', span)
+    await flushSession(ctx, session)
+    return { shadowed: span.shadowed.length, blocks: prepared.message.content.length }
+  } catch (error) {
+    // Once followup has been accepted, its message may already reference the
+    // newly saved attachments; cleanup is safe only before that boundary.
+    if (prepared && !queued) await discardCreatedAttachments(ctx, prepared.created)
+    throw error
+  }
 }
 
 async function opRegenerate(ctx, body) {
   const sessionId = body.sessionId
   const session = requireSession(ctx, sessionId)
-  const seq = Number(body.seq)
-  if (!Number.isFinite(seq)) throw rewindError('invalid-seq', '缺少消息位置')
+  const seq = body.seq
+  if (!Number.isSafeInteger(seq) || seq < 0) throw rewindError('invalid-seq', '缺少有效的消息位置')
 
+  const target = eventAt(session, seq)
+  if (!target || target.type !== 'assistant/message') {
+    throw rewindError('not-an-assistant-message', '只有助手回复可以重新生成')
+  }
   const nodes = surfaceNodes(session)
   let promptSeq
   const index = nodes.indexOf(seq)
@@ -394,12 +621,26 @@ async function opRegenerate(ctx, body) {
   const content = userBlocksOf(session, promptSeq) || []
   if (content.length === 0) throw rewindError('no-prompt', '原始提问已经不在上下文中')
 
-  await ensureIdle(ctx, sessionId)
-  const span = shadowSpan(session, promptSeq)
-  writeShadow(session, 'regenerate', span)
-  await flushSession(ctx, session)
-  const sent = await sendUserMessage(ctx, sessionId, content)
-  return { shadowed: span.shadowed.length, blocks: sent.blocks }
+  const agent = requireAgent(ctx, sessionId)
+  await ensureIdle(agent)
+  assertMutationReady(ctx, sessionId, session, agent)
+  if (!surfaceNodes(session).includes(seq)) throw rewindError('no-prompt', '这条回复已经不在上下文中')
+  let prepared
+  let queued = false
+  try {
+    prepared = await prepareUserMessage(ctx, content)
+    assertMutationReady(ctx, sessionId, session, agent)
+    if (!surfaceNodes(session).includes(seq)) throw rewindError('no-prompt', '这条回复已经不在上下文中')
+    const span = shadowSpan(session, promptSeq)
+    await queueFollowup(agent, prepared.message)
+    queued = true
+    writeShadow(session, 'regenerate', span)
+    await flushSession(ctx, session)
+    return { shadowed: span.shadowed.length, blocks: prepared.message.content.length }
+  } catch (error) {
+    if (prepared && !queued) await discardCreatedAttachments(ctx, prepared.created)
+    throw error
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -418,7 +659,8 @@ async function opAttachment(ctx, body) {
   if (body.kind === 'image') {
     if (typeof attachments.readImage !== 'function') throw rewindError('unsupported', '当前附件存储不支持读取图片')
     const stored = await attachments.readImage(ref)
-    const meta = (stored && stored.attachment) || {}
+    checkedAttachmentBytes(stored && stored.data)
+    const meta = (stored && (stored.ref || stored.attachment)) || {}
     return {
       name: meta.name || ref.name || 'image',
       mediaType: meta.mediaType || ref.mediaType || 'image/png',
@@ -428,7 +670,14 @@ async function opAttachment(ctx, body) {
 
   if (typeof attachments.readFileStream !== 'function') throw rewindError('unsupported', '当前附件存储不支持读取文件')
   const chunks = []
-  for await (const chunk of attachments.readFileStream(ref)) chunks.push(Buffer.from(chunk))
+  let total = 0
+  for await (const chunk of attachments.readFileStream(ref)) {
+    const bytes = attachmentBytes(chunk)
+    if (bytes === null) throw rewindError('invalid-attachment', '附件读取结果无效')
+    total += bytes
+    if (total > MAX_ATTACHMENT_BYTES) throw rewindError('attachment-too-large', '单个附件不能超过 16 MiB')
+    chunks.push(Buffer.from(chunk))
+  }
   return {
     name: typeof ref.name === 'string' ? ref.name : 'file',
     mediaType: 'application/octet-stream',
@@ -440,16 +689,19 @@ async function opUpload(ctx, body) {
   requireSession(ctx, body.sessionId)
   const attachments = ctx.get('attachments')
   if (!attachments) throw rewindError('attachments-unavailable', '附件服务不可用')
-  const data = typeof body.data === 'string' ? Buffer.from(body.data, 'base64') : null
-  if (!data || data.byteLength === 0) throw rewindError('invalid-attachment', '附件内容为空')
+  if (body.kind !== 'image' && body.kind !== 'file') throw rewindError('invalid-attachment', '未知附件类型')
+  const data = decodeBase64(body.data)
+  if (body.kind === 'image' && data.byteLength === 0) throw rewindError('invalid-attachment', '图片内容为空')
   const label = typeof body.name === 'string' && body.name !== '' ? body.name : 'attachment'
 
   if (body.kind === 'image') {
+    if (typeof attachments.saveImage !== 'function') throw rewindError('unsupported', '当前附件存储不支持保存图片')
     const mediaType = typeof body.mediaType === 'string' ? body.mediaType : 'image/png'
-    const ref = await attachments.saveImage({ data: new Uint8Array(data), mediaType, name: label })
+    const ref = await attachments.saveImage({ data, mediaType, name: label })
     return { block: { type: 'image', attachment: ref } }
   }
-  const ref = await attachments.saveFile({ data: new Uint8Array(data), name: label })
+  if (typeof attachments.saveFile !== 'function') throw rewindError('unsupported', '当前附件存储不支持保存文件')
+  const ref = await attachments.saveFile({ data, name: label })
   return { block: { type: 'file', attachment: ref } }
 }
 
@@ -458,6 +710,17 @@ async function opUpload(ctx, body) {
 /* ------------------------------------------------------------------ */
 
 export function apply(ctx) {
+  const activeSessions = new Set()
+  const mutate = async (body, operation) => {
+    const sessionId = body.sessionId
+    if (activeSessions.has(sessionId)) throw rewindError('operation-in-progress', '该会话正在修改，请稍后重试')
+    activeSessions.add(sessionId)
+    try {
+      return await operation(ctx, body)
+    } finally {
+      activeSessions.delete(sessionId)
+    }
+  }
   const log = (...args) => {
     try {
       const logger = typeof ctx.logger === 'function' ? ctx.logger('rewind') : undefined
@@ -489,9 +752,8 @@ export function apply(ctx) {
   }
 
   route('state', async body => ({ entries: foldState(requireSession(ctx, body.sessionId)).entries }))
-  route('edit', body => opEdit(ctx, body))
-  route('recall', body => opRecall(ctx, body))
-  route('regenerate', body => opRegenerate(ctx, body))
+  route('edit', body => mutate(body, opEdit))
+  route('regenerate', body => mutate(body, opRegenerate))
   route('attachment', body => opAttachment(ctx, body))
   route('upload', body => opUpload(ctx, body))
 

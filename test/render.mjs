@@ -2,11 +2,11 @@
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
 
-const require = createRequire('/tmp/rendertest/')
+const require = createRequire(import.meta.url)
 const React = require('react')
 const { renderToStaticMarkup } = require('react-dom/server')
 
-const source = fs.readFileSync('/Users/youngwu/Documents/code/dsh-rewind/client.js', 'utf8')
+const source = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8')
 
 const styleNodes = []
 const document = {
@@ -92,13 +92,12 @@ const userHtml = render('UserActionsRow', React.createElement(T.UserActionsRow, 
   sessionId: 's1', inputActions, t: (k) => k,
 }))
 check('user row has 编辑', userHtml.includes('编辑'), userHtml.includes('编辑'))
-check('user row has 重发', userHtml.includes('重发'), userHtml.includes('重发'))
-check('user row has 撤回', userHtml.includes('撤回'), userHtml.includes('撤回'))
+check('user row only has 编辑', (userHtml.match(/<button/g) || []).length === 1 && !userHtml.includes('重发') && !userHtml.includes('撤回'), userHtml)
 
 const assistantHtml = render('AssistantActions', React.createElement(T.AssistantActions, {
   messageId: 'm1', sessionId: 's1', useChat, t: (k) => k,
 }))
-check('assistant row has 2 icon buttons', (assistantHtml.match(/<button/g) || []).length === 2, (assistantHtml.match(/<button/g) || []).length)
+check('assistant row only has regeneration', (assistantHtml.match(/<button/g) || []).length === 1 && assistantHtml.includes('重新生成这条回复') && !assistantHtml.includes('撤回'), assistantHtml)
 
 const markerHtml = render('MarkerRow', React.createElement(T.MarkerRow, {
   node: { key: '15:rewind-marker9', kind: 'rewind-marker', anchorSeq: 9, data: { kind: 'recall', startSeq: 2, endSeq: 9, shadowed: [2, 4] } },
@@ -107,7 +106,7 @@ const markerHtml = render('MarkerRow', React.createElement(T.MarkerRow, {
 check('marker shows 已撤回', markerHtml.includes('已撤回'), markerHtml.slice(0, 120))
 check('marker offers 放回输入框', markerHtml.includes('放回输入框'), markerHtml.includes('放回输入框'))
 
-const dialogHelpers = ['mountDialog', 'openEditDialog', 'openRecallDialog', 'closeAllDialogs']
+const dialogHelpers = ['mountDialog', 'openEditDialog', 'closeAllDialogs']
 const missingHelpers = dialogHelpers.filter((name) => typeof T[name] !== 'function')
 check('dialog helpers are exported for the DOM layer', missingHelpers.length === 0, missingHelpers.join(','))
 check('dialogs are no longer React components', T.EditDialog === undefined && T.ConfirmRecall === undefined, typeof T.EditDialog)
